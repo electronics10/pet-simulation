@@ -1,0 +1,196 @@
+narg= 2 
+
+
+     *****************************************************************************
+     ***                                                                       ***
+     ***            MCGPU-PET_v0.1  (based on MC-GPU_v1.3)                     ***
+     ***                                                                       ***
+     ***     -Distribution:                                                    ***
+     ***            https://github.com/DIDSR/MCGPU-PET                         ***
+     ***                                                                       ***
+     ***     -Authors:                                                         ***
+     ***        MCGPU code foundation and PET source sampling implemented by:  ***
+     ***          - Andreu Badal (Andreu.Badal-Soler[at]fda.hhs.gov)           ***
+     ***                Division of Imaging and Applied Mathematics            ***
+     ***                Office of Science and Engineering Laboratories         ***
+     ***                Center for Devices and Radiological Health             ***
+     ***                U.S. Food and Drug Administration                      ***
+     ***                                                                       ***
+     ***        PET detector model and sinogram reporting implemented by:      ***
+     ***          - Joaquin L. Herraiz and Alejandro López-Montes              ***
+     ***                Complutense University of Madrid, EMFTEL, Grupo Fisica ***
+     ***                Nuclear and IPARCOS; Instituto de Investigacion        ***
+     ***                Sanitaria Hospital Clinico San Carlos (IdiSSC), Spain  ***
+     ***                                                                       ***
+     ***     -Code presented at the IEEE NSS MIC 2021 conference:              ***
+     ***       M-07-01 – GPU-accelerated Monte Carlo-Based Scatter and         ***
+     ***       Prompt-Gamma Corrections in PET, A. López-Montes, J. Cabello,   ***
+     ***       M. Conti, A. Badal, J. L. Herraiz                               ***
+     ***                                                                       ***
+     ***                                      Last update: 2022/02/02          ***
+     *****************************************************************************
+
+****** Code execution started on: Thu Apr 23 09:59:01 2026
+
+
+
+             *** CUDA SIMULATION IN THE GPU ***
+
+    -- INITIALIZATION phase:
+
+    -- Reading the input file 'MCGPU-PET.in':
+
+    -- Seed used in the execution '870678909':
+       Material dose deposition tally ENABLED.
+       3D voxel dose deposition tally DISABLED.
+
+       PSF file correctly allocated (150000000 elements, 6294.250488 Mbytes)
+                   PET acquistion time = 1.000000 s
+                     mean life isotope = 70000.000000
+                      Input voxel file = phantom_9x9x9cm.vox
+                   initial random seed = 870678909
+
+   ----- Factor OBJECT = 1.000000 
+
+    -- Reading voxel file 'phantom_9x9x9cm.vox':
+         (note that MC-GPU can also read voxel and material files compressed with gzip)
+       Number of voxels in the input geometry file: 9 x 9 x 9 =  729
+       Size of the input voxels: 1.000000 x 1.000000 x 1.000000 cm  (voxel volume=1.000000 cm^3)
+       Voxel bounding box size: 9.000000 x 9.000000 x 9.000000 cm
+
+    -- Initializing the voxel material and density vector (0.008343 Mbytes)...
+       Total number of voxels read: 729
+       Total CPU memory allocated for voxels vector and data structures = 6295.727976 Mbytes
+
+    -- Reading the material data files (MAX_MATERIALS=15):
+         Mat 1: File './materials/air_5-515keV.mcgpu.gz'
+                Nominal density = 0.001205 g/cm^3; Max density in voxels = 0.001200 g/cm^3
+                Number of energy values in the mean free path database: 10200.
+                Linear interpolation data correctly allocated (3.579712 Mbytes)
+                Lowest energy first bin = 5000.000000 eV, last bin = 514950.000000 eV; bin width = 50.000000 eV
+         Mat 2: File './materials/water_5-515keV.mcgpu.gz'
+                Nominal density = 1.000000 g/cm^3; Max density in voxels = 1.000000 g/cm^3
+
+
+    ** INPUT PET DETECTOR PARAMETERS  **
+           Phase Space File (PSF) size =  150000000
+                   PSF detector center = (4.50000,4.50000,4.50000) cm
+        PSF detector height and radius = 12.65600, 9.05000 cm
+                       Output PSF file = MCGPU_PET.psf
+                       PSF will include True and Scatter coincidences.
+
+
+            Detector energy resolution = 0.120000
+     Low, high energy window threshold = 350000.000000 , 600000.000000
+
+
+
+       ==> CUDA: 1 CUDA enabled GPU detected! Using device #0: "NVIDIA TITAN RTX"
+                 Compute capability: 7.5, Number multiprocessors: 72
+                 Clock rate: 1.77 GHz, Global memory: 24020.125 Mbyte, Constant memory: 64.00 kbyte
+                 Shared memory per block: 48.00 kbyte, Registers per block: 64.00 kbyte
+                 CUDA Driver Version: 13.0, Runtime Version: 12.0
+
+
+
+
+   !!WARNING!! The selected GPU is connected to a display and therefore CUDA driver will limit the kernel run time to 5 seconds and the simulation will likely fail!!
+              You can fix this by executing the simulation in a different GPU (select number in the input file) or by turning off the window manager and using the text-only Linux shell.
+
+
+       ==> CUDA: Constant data successfully copied to the device. CONSTANT memory used: 0.183594 kbytes (0.3%)
+       ==> CUDA: Device global memory correctly allocated. GLOBAL memory used: 6299.307629 Mbytes (26.2%)
+                 Time spent allocating and copying memory to the device: 0.668814 s
+
+    -- INITIALIZATION finished: elapsed time = 3.437 s. 
+
+
+
+    -- MONTE CARLO LOOP phase. Time: Thu Apr 23 09:59:05 2026
+
+
+
+
+        ==> CUDA: simulating 9 x 9 x 9 blocks of 32 threads.
+
+
+
+
+    -- MONTE CARLO LOOP finished: time tallied in main program: 0.005 s
+                                  Total number of histories simulated = 23888 (note: each annihilation produces 2 histories)
+                                  Number of coincidences stored in the PSF = 4556
+
+
+
+
+       ****** MCGPU-PET PHASE SPACE FILE INFORMATION ******
+
+           >>> Number of elements in the PSF  = 9112
+           >>> First elements of the PSF reported in ASCII at 'MCGPU_PET.psf' (see its header for more information); complete PSF in binary at 'MCGPU_PET.psf.raw'
+           >>> PET acquistion time = 1.000000 s
+           >>> mean life isotope   = 70000.000000
+           >>> PSF includes both True and Scatter coincidences.
+           >>> Reported both PSF and Sinogram.
+
+
+    -- Time spent downloading the PSF from the GPU to the CPU: 0.0001 s ; time spent reporting PSF to disk: 0.0086 s
+
+       ==> CUDA: Time freeing the device memory and ending the GPU threads: 0.128172 s
+
+
+          *** MATERIALS TOTAL DOSE TALLY REPORT ***
+
+              Dose deposited in each material defined in the input file (tallied directly per material, not per voxel):
+              The results of this tally should be equal to the voxel tally doses for an ROI covering all voxels.
+              Total number of simulated x rays: 23888
+	 [MAT]  [DOSE eV/g/hist]  [2*std_dev]  [Rel_error 2*std_dev, %]  [E_dep eV/hist]  [DOSE mGy]  [Material mass g]  [Material file name]
+	======================================================================================================================================
+	1	79.51103		52.30778		65.79		57.72501		0.00000		0.72600		air_5-515keV.mcgpu.gz
+	2	323.39040		9.07618		2.81		40100.40979		0.00000		124.00000		water_5-515keV.mcgpu.gz
+
+
+       ==> CUDA: Time reporting the dose data: 0.000011 s
+
+
+       ****** MCGPU-PET SINOGRAM INFORMATION ******
+
+           >>> Number of radial bins = 147
+           >>> Number of angular bins = 168
+           >>> Total number of sinograms = 1293
+           >>> Maximum Ring Difference = 79
+           >>> SPAN = 11
+           >>> Number segments = 15
+           >>> Number z slices = 159
+
+           >>> Number of true coincidences in the sinogram = 3809  
+           >>> Number of scatter coincidences in the sinogram = 758  
+           >>> Size of the 3D sinogram = 147 X 168 X 1293
+
+
+       ****** MCGPU-PET IMAGES INFORMATION ******
+
+           >>> Two binary 3D matrix (32-bit integer per voxel) with same size as the input voxelized geometry.
+           >>> Report how many detected coincidences, Trues and Scatter separately, were emitted from each voxel.
+
+           >>> Number of voxels = (9,9,9)
+           >>> Number of true counts in the image of trues = 3809  
+           >>> Number of scatter counts in the image of scatter = 758  
+
+
+
+    -- SIMULATION FINISHED!
+
+
+       ****** TOTAL SIMULATION PERFORMANCE (including initialization and reporting) ******
+
+          >>> Execution time including initialization, transport and report: 4.791 s.
+          >>> Time spent in the Monte Carlo transport only: 0.005 s.
+          >>> Time spent in initialization, reporting and clean up: 4.786 s.
+          >>> Total number of simulated histories (x-rays):  23888  (note: each positron annihilation produces 2 histories)
+          >>> Total speed (using 1 thread, including transport, initialization and report times) [x-rays/s]:  4985.55
+          >>> Total speed Monte Carlo transport only (using 1 thread) [x-rays/s]:  4722815.34
+
+
+****** Code execution finished on: Thu Apr 23 09:59:06 2026
+
+
