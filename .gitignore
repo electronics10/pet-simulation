@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Data and others
+runs/
+MCGPU-PET/sample_simulation/MCGPU_PET.psf*
+MCGPU-PET/sample_simulation/image_*.raw*
+MCGPU-PET/sample_simulation/sinogram_*.raw*
+MCGPU-PET/sample_simulation/*.dat
+MCGPU-PET/sample_simulation/MCGPU-PET.x
+MCGPU-PET/sample_simulation/MCGPU-PET.out
