@@ -119,16 +119,16 @@ class TestPresets:
     def test_mcgpu_sample_matches_reference(self):
         """The mcgpu_sample preset must reproduce the parameters we
         actually observed in the MCGPU-PET.in sample simulation output:
-        sinogram 147 radial x 168 angular x 1293 slices, span 11, MRD 79.
+        sinogram 147 radial x 168 angular x 159 slices (input parameter — output expands via span compression).
         """
         s = Scanner.from_preset("mcgpu_sample")
         assert s.n_radial_bins == 147
         assert s.n_angular_bins == 168
-        assert s.n_z_slices == 1293
+        assert s.n_z_slices == 159
         assert s.span == 11
         assert s.max_ring_difference == 79
         assert s.energy_window_keV == (350.0, 600.0)
-        assert s.sinogram_shape == (1293, 168, 147)
+        assert s.sinogram_shape == (159, 168, 147)
 
     def test_bruker_albira_preset_matches_gate_script(self):
         s = Scanner.from_preset("bruker_albira")
@@ -150,6 +150,16 @@ class TestPresets:
         assert s.name == "custom"
         # Other fields still come from the preset
         assert s.n_radial_bins == 147
+
+    def test_mcgpu_preset_has_ring_structure(self):
+        """The mcgpu_sample preset must include n_rings and n_crystals_per_ring,
+        which are required by the MCGPU-PET backend.
+        """
+        s = Scanner.from_preset("mcgpu_sample")
+        assert s.n_rings == 80
+        assert s.n_crystals_per_ring == 336
+        # Angular bins should be half the crystals per ring (full 2π coverage)
+        assert s.n_angular_bins == s.n_crystals_per_ring // 2
 
     def test_all_presets_instantiate(self):
         """Every preset in SCANNER_PRESETS must produce a valid Scanner."""
@@ -240,7 +250,7 @@ class TestProperties:
     def test_sinogram_shape_ordering(self):
         """sinogram_shape is (n_z_slices, n_angular_bins, n_radial_bins)."""
         s = Scanner.from_preset("mcgpu_sample")
-        assert s.sinogram_shape == (1293, 168, 147)
+        assert s.sinogram_shape == (159, 168, 147)
 
     def test_energy_window_unit_conversion(self):
         s = Scanner.from_preset("mcgpu_sample")

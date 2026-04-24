@@ -68,7 +68,7 @@ class Source:
     # ---- validation ------------------------------------------------------
 
     def __post_init__(self) -> None:
-        self.activity_Bq = np.asarray(self.activity_Bq, dtype=np.float32)
+        self.activity_Bq = np.asarray(self.activity_Bq, dtype=np.float64)
 
         if self.activity_Bq.ndim != 3:
             raise ValueError(
@@ -142,7 +142,7 @@ class Source:
         """A source with zero activity everywhere. Useful as a starting
         point for building up activity distributions manually.
         """
-        activity = np.zeros(phantom.shape, dtype=np.float32)
+        activity = np.zeros(phantom.shape, dtype=np.float64)
         return cls(
             activity_Bq=activity,
             voxel_size=phantom.voxel_size,
@@ -157,7 +157,7 @@ class Source:
         isotope: str = "F18",
     ) -> "Source":
         """Construct from an explicit activity array aligned with a phantom."""
-        activity_Bq = np.asarray(activity_Bq, dtype=np.float32)
+        activity_Bq = np.asarray(activity_Bq, dtype=np.float64)
         if activity_Bq.shape != phantom.shape:
             raise ValueError(
                 f"activity array shape {activity_Bq.shape} does not match "
@@ -195,7 +195,7 @@ class Source:
 
         idx = phantom.material_names.index(material) + 1  # 1-indexed
         mask = phantom.material_ids == idx
-        activity = np.zeros(phantom.shape, dtype=np.float32)
+        activity = np.zeros(phantom.shape, dtype=np.float64)
         activity[mask] = float(activity_per_voxel_Bq)
 
         return cls(
@@ -236,7 +236,7 @@ class Source:
                 f"material {material!r} occupies zero voxels in this phantom"
             )
 
-        activity = np.zeros(phantom.shape, dtype=np.float32)
+        activity = np.zeros(phantom.shape, dtype=np.float64)
         activity[mask] = total_activity_Bq / n_voxels
 
         return cls(

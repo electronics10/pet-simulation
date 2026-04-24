@@ -101,6 +101,15 @@ class Scanner:
     # ---- Coincidence timing (optional) ---------------------------------
     coincidence_window_ns: float | None = None
 
+    # ---- Detector ring structure (optional, required for MCGPU-PET) ----
+    # Number of detector rings stacked axially. Called "NUMBER OF ROWS"
+    # in MCGPU-PET's .in file.
+    n_rings: int | None = None
+    # Crystals distributed around one ring. Called "TOTAL NUMBER OF CRYSTALS"
+    # in MCGPU-PET's .in file (confusingly — it's per-ring, not total).
+    # Typically equals 2 * n_angular_bins for sinograms with full 2π coverage.
+    n_crystals_per_ring: int | None = None
+
     # ---- Crystal-level geometry (optional, for GATE) -------------------
     crystal_size_mm: tuple[float, float, float] | None = None
     crystal_material: str | None = None
@@ -300,12 +309,15 @@ SCANNER_PRESETS: dict[str, dict[str, Any]] = {
         "acquisition_time_s": 1.0,
         "n_radial_bins": 147,
         "n_angular_bins": 168,
-        "n_z_slices": 1293,
+        "n_z_slices": 159,       # input parameter; output sinogram has
+                                  # more slices after span compression
         "span": 11,
         "max_ring_difference": 79,
         "binning_convention": "mcgpu_span11_mrd79",
         "tof_enabled": False,
         "normalization": "none",
+        "n_rings": 80,
+        "n_crystals_per_ring": 336,
     },
 
     # Mirrors gate-pet/bruker_pet_sim.py:

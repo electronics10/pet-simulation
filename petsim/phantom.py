@@ -81,7 +81,7 @@ class Phantom:
     def __post_init__(self) -> None:
         # Coerce to numpy arrays so users can pass lists / tuples
         self.material_ids = np.asarray(self.material_ids, dtype=np.int32)
-        self.densities = np.asarray(self.densities, dtype=np.float32)
+        self.densities = np.asarray(self.densities, dtype=np.float64)
 
         if self.material_ids.shape != self.densities.shape:
             raise ValueError(
@@ -177,7 +177,7 @@ class Phantom:
         """A phantom filled entirely with one material."""
         nx, ny, nz = shape
         material_ids = np.ones((nx, ny, nz), dtype=np.int32)
-        densities = np.full((nx, ny, nz), density, dtype=np.float32)
+        densities = np.full((nx, ny, nz), density, dtype=np.float64)
         return cls(
             material_ids=material_ids,
             densities=densities,
@@ -206,7 +206,7 @@ class Phantom:
             inner_size_vox = max(1, int(round(min(nx, ny, nz) * 5 / 9)))
 
         material_ids = np.ones((nx, ny, nz), dtype=np.int32)  # 1 = outer
-        densities = np.full((nx, ny, nz), outer_density, dtype=np.float32)
+        densities = np.full((nx, ny, nz), outer_density, dtype=np.float64)
 
         # Centered inner cube
         def slab(n: int, w: int) -> slice:
@@ -249,7 +249,7 @@ class Phantom:
         dx, dy, dz = voxel_size
 
         material_ids = np.ones((nx, ny, nz), dtype=np.int32)
-        densities = np.full((nx, ny, nz), outer_density, dtype=np.float32)
+        densities = np.full((nx, ny, nz), outer_density, dtype=np.float64)
 
         # Voxel center coordinates in cm, origin at phantom corner
         xs = (np.arange(nx) + 0.5) * dx
@@ -298,7 +298,7 @@ class Phantom:
         dx, dy, dz = voxel_size
 
         material_ids = np.ones((nx, ny, nz), dtype=np.int32)
-        densities = np.full((nx, ny, nz), outer_density, dtype=np.float32)
+        densities = np.full((nx, ny, nz), outer_density, dtype=np.float64)
 
         xs = (np.arange(nx) + 0.5) * dx
         ys = (np.arange(ny) + 0.5) * dy
