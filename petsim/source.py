@@ -337,7 +337,7 @@ class Source:
         np.savez_compressed(
             path,
             activity_Bq=self.activity_Bq,
-            voxel_size=np.array(self.voxel_size, dtype=np.float32),
+            voxel_size=np.array(self.voxel_size, dtype=np.float64),
             isotope=np.array(self.isotope),
         )
 

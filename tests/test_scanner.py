@@ -246,3 +246,79 @@ class TestProperties:
         s = Scanner.from_preset("mcgpu_sample")
         assert s.energy_window_keV == (350.0, 600.0)
         assert s.energy_window_eV == (350000.0, 600000.0)
+
+
+# =====================================================================
+# Forward-model explicitness (ChatGPT review point #1 & #2)
+# =====================================================================
+
+
+class TestForwardModelFields:
+    def test_defaults_are_safe(self):
+        """When not specified, forward-model fields default to 'unknown'
+        safe values: unspecified binning, no TOF, no corrections.
+        """
+        s = Scanner(
+            name="minimal", detector_radius_cm=10.0,
+            detector_axial_length_cm=10.0,
+            energy_window_keV=(350.0, 650.0), energy_resolution=0.12,
+            acquisition_time_s=1.0, n_radial_bins=128, n_angular_bins=128,
+            n_z_slices=63, span=3, max_ring_difference=31,
+        )
+        assert s.binning_convention == "unspecified"
+        assert s.tof_enabled is False
+        assert s.normalization == "none"
+
+    def test_mcgpu_preset_declares_convention(self):
+        s = Scanner.from_preset("mcgpu_sample")
+        assert s.binning_convention == "mcgpu_span11_mrd79"
+        assert s.tof_enabled is False
+        assert s.normalization == "none"
+
+    def test_bruker_preset_declares_convention(self):
+        s = Scanner.from_preset("bruker_albira")
+        assert s.binning_convention == "gate_span3_mrd31"
+
+    def test_unknown_normalization_raises(self):
+        with pytest.raises(ValueError, match="normalization"):
+            Scanner(
+                name="bad", detector_radius_cm=10.0,
+                detector_axial_length_cm=10.0,
+                energy_window_keV=(350.0, 650.0), energy_resolution=0.12,
+                acquisition_time_s=1.0, n_radial_bins=128, n_angular_bins=128,
+                n_z_slices=63, span=3, max_ring_difference=31,
+                normalization="fancy_made_up_correction",
+            )
+
+    def test_is_compatible_with_same_preset(self):
+        """Same preset twice → compatible."""
+        s1 = Scanner.from_preset("mcgpu_sample")
+        s2 = Scanner.from_preset("mcgpu_sample")
+        assert s1.is_compatible_with(s2)
+
+    def test_is_compatible_different_binning(self):
+        """Different binning convention → incompatible even if geometry matches."""
+        s1 = Scanner.from_preset("mcgpu_sample")
+        s2 = Scanner.from_preset(
+            "mcgpu_sample", binning_convention="different_scheme"
+        )
+        assert not s1.is_compatible_with(s2)
+
+    def test_is_compatible_different_shape(self):
+        """Different sinogram shape → incompatible."""
+        s1 = Scanner.from_preset("mcgpu_sample")
+        s2 = Scanner.from_preset("bruker_albira")
+        assert not s1.is_compatible_with(s2)
+
+    def test_forward_model_fields_round_trip(self, tmp_path: Path):
+        """Forward-model fields must survive save/load."""
+        s = Scanner.from_preset(
+            "mcgpu_sample", tof_enabled=True,
+            normalization="attenuation_corrected",
+        )
+        out = tmp_path / "s.yaml"
+        s.save(out)
+        loaded = Scanner.load(out)
+        assert loaded.binning_convention == s.binning_convention
+        assert loaded.tof_enabled is True
+        assert loaded.normalization == "attenuation_corrected"

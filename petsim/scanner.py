@@ -4,7 +4,24 @@ Scanner: PET scanner geometry and acquisition parameters.
 A Scanner describes the *measurement system* — the forward model A in the
 inverse problem y = A(x). It captures everything needed to interpret what
 each sinogram bin means physically: detector geometry, energy window,
-timing resolution, and sinogram binning convention.
+timing resolution, sinogram binning convention, and normalization
+assumptions.
+
+Making A explicit matters because two scanners with the same geometry can
+still produce incompatible sinograms if they disagree about:
+
+  - how LORs are indexed (the binning convention)
+  - whether TOF information is preserved
+  - whether the sinogram has been normalized or attenuation-corrected
+
+Every Scanner therefore carries three fields that force the forward-model
+assumptions to be written down, not assumed:
+
+  - binning_convention: free-form string identifying the LOR indexing
+    scheme, e.g. "mcgpu_span11_mrd79" or "gate_listmode". Two sinograms
+    with different binning_convention values are NOT directly comparable.
+  - tof_enabled: whether the measurement preserves arrival-time info.
+  - normalization: what corrections have been applied to the sinogram.
 
 Two levels of detail are supported:
 
@@ -73,6 +90,14 @@ class Scanner:
     span: int                          # axial compression (Michelogram span)
     max_ring_difference: int           # "MRD"
 
+    # ---- Forward-model assumptions (required for comparability) --------
+    # These three fields make the "A" in y = A(x) explicit. Two sinograms
+    # with different values here are NOT directly comparable, even if all
+    # the geometry numbers match. See module docstring for rationale.
+    binning_convention: str = "unspecified"
+    tof_enabled: bool = False
+    normalization: str = "none"         # "none" | "attenuation_corrected" | ...
+
     # ---- Coincidence timing (optional) ---------------------------------
     coincidence_window_ns: float | None = None
 
@@ -134,6 +159,21 @@ class Scanner:
                 f"got {self.coincidence_window_ns}"
             )
 
+        # Validate normalization against known values. Expand this list
+        # as real normalization pipelines are implemented.
+        allowed_normalizations = {
+            "none",
+            "attenuation_corrected",
+            "normalization_corrected",
+            "scatter_corrected",
+            "fully_corrected",
+        }
+        if self.normalization not in allowed_normalizations:
+            raise ValueError(
+                f"unknown normalization {self.normalization!r}; "
+                f"allowed: {sorted(allowed_normalizations)}"
+            )
+
     # ---- convenience --------------------------------------------------
 
     @property
@@ -150,6 +190,22 @@ class Scanner:
         """Energy window in eV (MCGPU-PET's native unit)."""
         lo, hi = self.energy_window_keV
         return (lo * 1000.0, hi * 1000.0)
+
+    def is_compatible_with(self, other: "Scanner") -> bool:
+        """Check whether sinograms from two scanners are directly
+        comparable bin-for-bin.
+
+        Comparability requires identical sinogram shape AND identical
+        forward-model assumptions (binning convention, TOF, normalization).
+        Two scanners can share geometry but be incompatible if they
+        disagree on indexing or corrections.
+        """
+        return (
+            self.sinogram_shape == other.sinogram_shape
+            and self.binning_convention == other.binning_convention
+            and self.tof_enabled == other.tof_enabled
+            and self.normalization == other.normalization
+        )
 
     # ---- factories ----------------------------------------------------
 
@@ -247,6 +303,9 @@ SCANNER_PRESETS: dict[str, dict[str, Any]] = {
         "n_z_slices": 1293,
         "span": 11,
         "max_ring_difference": 79,
+        "binning_convention": "mcgpu_span11_mrd79",
+        "tof_enabled": False,
+        "normalization": "none",
     },
 
     # Mirrors gate-pet/bruker_pet_sim.py:
@@ -268,6 +327,9 @@ SCANNER_PRESETS: dict[str, dict[str, Any]] = {
         "n_z_slices": 63,
         "span": 3,
         "max_ring_difference": 31,
+        "binning_convention": "gate_span3_mrd31",
+        "tof_enabled": False,
+        "normalization": "none",
         "coincidence_window_ns": 10.0,
         "crystal_size_mm": (10.0, 6.0, 6.0),
         "crystal_material": "LYSO",

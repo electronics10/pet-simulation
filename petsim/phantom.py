@@ -16,6 +16,28 @@ Only material_ids and densities vary per voxel. voxel_size is grid-wide.
 Backend-specific serialization (e.g. writing .vox files for MCGPU-PET)
 lives in the backend modules, not here. This module only handles the
 simulator-agnostic representation and npz persistence for the storage format.
+
+Coordinate convention (petsim-wide)
+-----------------------------------
+The petsim coordinate system is fixed as follows. Every Phantom, Source,
+and Scanner in petsim adheres to these rules, and backends are responsible
+for translating to and from their native conventions at write time.
+
+  - Origin: voxel (0, 0, 0) — the corner of the grid, NOT the center.
+  - Axes: +x, +y, +z in array index order. For a numpy array `a`,
+    `a[ix, iy, iz]` is the voxel at position (ix*dx, iy*dy, iz*dz).
+  - Units: centimeters everywhere in the public API. Backends convert
+    to their native units (MCGPU-PET uses cm natively; GATE uses mm).
+  - Voxel position: a voxel's spatial center is at
+    `((ix+0.5)*dx, (iy+0.5)*dy, (iz+0.5)*dz)`.
+  - Phantom extent: total physical size is
+    `(nx*dx, ny*dy, nz*dz)` in cm.
+
+Rationale for corner origin over center origin: all three backends
+(MCGPU-PET .vox, GATE voxelized sources, numpy itself) treat the grid as
+indexed from a corner. Using center-origin would require bookkeeping every
+time we round-trip through a file format. Users who need center-origin
+coordinates can compute them as needed via the `extent_cm` property.
 """
 
 from __future__ import annotations
@@ -306,7 +328,7 @@ class Phantom:
             path,
             material_ids=self.material_ids,
             densities=self.densities,
-            voxel_size=np.array(self.voxel_size, dtype=np.float32),
+            voxel_size=np.array(self.voxel_size, dtype=np.float64),
             material_names=np.array(self.material_names),
         )
 

@@ -1,31 +1,35 @@
 """
 Run: a complete simulation on disk.
 
-A `Run` represents one executed simulation in the standard storage layout:
+A Run represents one end-to-end simulation bundle:
+
+    x (ground truth) = Phantom + Source
+    A (forward model) = Scanner
+    y (measurement)   = Sinogram
+
+All four components plus a manifest live in a single directory following
+the storage format from PLAN.md:
 
     runs/001_water_cylinder/
-    ├── run.yaml                ← manifest: backend, seed, git hash, wall time
-    ├── phantom.npz             ← x: material_ids, densities, voxel_size
-    ├── source.npz              ← x: activity_map, isotope
-    ├── scanner.yaml            ← A: geometry, energy window, binning
-    ├── sinogram.npz            ← y: trues, scatter, randoms
-    └── simulator_output/       ← raw backend files (gitignored)
+    ├── run.yaml          ← manifest: backend, seed, git hash, wall time, counts
+    ├── phantom.npz       ← x (geometry + materials)
+    ├── source.npz        ← x (activity distribution)
+    ├── scanner.yaml      ← A (forward model)
+    ├── sinogram.npz      ← y (measurement, backend-agnostic format)
+    └── simulator_output/ ← raw backend-specific outputs (not loaded by Run)
 
-The Run class bundles the four petsim objects (Phantom, Source, Scanner,
-Sinogram) together with a manifest dict and provides save() / load()
-methods that operate on a directory rather than a single file.
+The `Run` class is the top-level API for saving / loading an entire
+simulation. Backends (Phase 2+) produce `Run` objects; downstream code
+(analysis, DL training) consumes them.
 
-This is the class that Phase 2 and Phase 3 backends will ultimately
-return from their .run() methods.
-
-The Run class itself is simulator-agnostic — it contains no code for
-running simulations. It's a container for the *result* of a simulation,
-regardless of which backend produced it.
+This module has no backend-specific logic — backends call `Run.save` after
+they finish running the simulator.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,9 +41,8 @@ from .sinogram import Sinogram
 from .source import Source
 
 
-# File names used in the storage format. These are intentionally fixed —
-# the layout is part of the project's public contract, so tooling and
-# humans alike can predict where things live.
+# File names inside a run directory. Kept as module-level constants so
+# backends and tests can reference them consistently.
 MANIFEST_FILENAME = "run.yaml"
 PHANTOM_FILENAME = "phantom.npz"
 SOURCE_FILENAME = "source.npz"
@@ -50,184 +53,175 @@ SIMULATOR_OUTPUT_DIRNAME = "simulator_output"
 
 @dataclass
 class Run:
-    """A complete simulation stored on disk.
+    """A complete PET simulation bundle.
 
     Attributes
     ----------
-    path : Path
-        Directory where this run lives (or will live).
     phantom : Phantom
-        The phantom geometry and materials (x_geometry).
+        Ground truth geometry and materials.
     source : Source
-        The activity distribution (x_activity).
+        Ground truth radioactivity distribution.
     scanner : Scanner
-        The scanner that produced the sinogram (A).
-    sinogram : Sinogram | None
-        The measurement (y). May be None if the run is in the "inputs
-        written but simulator not yet invoked" state.
-    manifest : dict
-        Free-form run metadata. Common keys:
+        Forward model — scanner geometry and binning.
+    sinogram : Sinogram
+        Measurement — coincidence histograms. None if the simulation has
+        not been run yet (a prepared-but-unrun bundle).
+    seed : int | None
+        RNG seed used for this run. First-class field because
+        reproducibility is critical for ML: the same seed must produce
+        statistically identical output, and changing the seed is the
+        standard way to generate noise-pair datasets. Backends are
+        responsible for actually feeding this seed to the simulator.
+    metadata : dict
+        Free-form manifest fields. Backends populate:
           - backend: "mcgpu" | "gate"
-          - seed: int
-          - git_hash: str
           - wall_time_seconds: float
-          - created: ISO-8601 timestamp
-          - petsim_version: str
-        Additional keys may be added by backends.
+          - git_hash: str
+          - created_at: ISO 8601 string
+          - simulator_version: str
+          - plus anything the backend wants to record
     """
 
-    path: Path
     phantom: Phantom
     source: Source
     scanner: Scanner
     sinogram: Sinogram | None = None
-    manifest: dict[str, Any] = field(default_factory=dict)
+    seed: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     # ---- validation ---------------------------------------------------
 
     def __post_init__(self) -> None:
-        self.path = Path(self.path)
-
-        # The phantom and source must live on the same voxel grid —
-        # this is the "x" side of the inverse problem.
         if not self.source.matches(self.phantom):
             raise ValueError(
-                f"source shape {self.source.shape} or voxel size "
-                f"{self.source.voxel_size} does not match phantom "
-                f"({self.phantom.shape}, {self.phantom.voxel_size})"
+                f"source grid {self.source.shape} {self.source.voxel_size} cm "
+                f"does not match phantom grid {self.phantom.shape} "
+                f"{self.phantom.voxel_size} cm"
             )
-
-        # If a sinogram is provided, its scanner must match this run's scanner.
         if self.sinogram is not None and self.sinogram.scanner != self.scanner:
             raise ValueError(
-                "sinogram.scanner does not match the run's scanner; "
-                "the sinogram was produced by a different scanner"
+                "sinogram.scanner does not match run.scanner; "
+                "did you accidentally pass a mismatched scanner?"
             )
-
-    # ---- file path helpers -------------------------------------------
-
-    @property
-    def manifest_path(self) -> Path:
-        return self.path / MANIFEST_FILENAME
-
-    @property
-    def phantom_path(self) -> Path:
-        return self.path / PHANTOM_FILENAME
-
-    @property
-    def source_path(self) -> Path:
-        return self.path / SOURCE_FILENAME
-
-    @property
-    def scanner_path(self) -> Path:
-        return self.path / SCANNER_FILENAME
-
-    @property
-    def sinogram_path(self) -> Path:
-        return self.path / SINOGRAM_FILENAME
-
-    @property
-    def simulator_output_dir(self) -> Path:
-        return self.path / SIMULATOR_OUTPUT_DIRNAME
 
     # ---- persistence --------------------------------------------------
 
-    def save(self) -> None:
-        """Write all four object files and the manifest into self.path.
+    def save(self, run_dir: str | Path) -> None:
+        """Write the entire run to a directory following the storage format.
 
-        Creates the directory (and any needed parents) if it doesn't
-        exist. Does NOT touch simulator_output/ — that's managed by
-        backends and is not part of the Run's responsibility.
+        Creates `run_dir` if it doesn't exist. Does not touch
+        `simulator_output/` — backends write that themselves during or
+        before calling save().
+
+        If `sinogram` is None, no sinogram.npz file is written, and the
+        manifest records `has_sinogram: false`.
         """
-        self.path.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-        self.phantom.save(self.phantom_path)
-        self.source.save(self.source_path)
-        self.scanner.save(self.scanner_path)
+        self.phantom.save(run_dir / PHANTOM_FILENAME)
+        self.source.save(run_dir / SOURCE_FILENAME)
+        self.scanner.save(run_dir / SCANNER_FILENAME)
         if self.sinogram is not None:
-            self.sinogram.save(self.sinogram_path)
+            self.sinogram.save(run_dir / SINOGRAM_FILENAME)
 
-        with open(self.manifest_path, "w") as f:
-            yaml.safe_dump(
-                self.manifest, f, sort_keys=False, default_flow_style=False
-            )
+        # Build the manifest. Always populate created_at if not provided.
+        manifest = dict(self.metadata)
+        manifest.setdefault("created_at", datetime.now().isoformat())
+        manifest["seed"] = self.seed
+        manifest["has_sinogram"] = self.sinogram is not None
+        manifest["files"] = {
+            "phantom": PHANTOM_FILENAME,
+            "source": SOURCE_FILENAME,
+            "scanner": SCANNER_FILENAME,
+            "sinogram": SINOGRAM_FILENAME if self.sinogram is not None else None,
+        }
+
+        with open(run_dir / MANIFEST_FILENAME, "w") as f:
+            yaml.safe_dump(manifest, f, sort_keys=False, default_flow_style=False)
 
     @classmethod
-    def load(cls, path: str | Path) -> "Run":
-        """Load a Run from its directory.
+    def load(cls, run_dir: str | Path) -> "Run":
+        """Load a complete run from a directory produced by save().
 
-        The phantom, source, and scanner files are all required. The
-        sinogram is optional (a run with inputs prepared but not yet
-        executed won't have one). The manifest is optional and defaults
-        to an empty dict if missing.
+        The manifest's has_sinogram flag determines whether sinogram.npz
+        is read. If the file is missing but has_sinogram is true, an
+        error is raised.
         """
-        path = Path(path)
-        if not path.is_dir():
-            raise NotADirectoryError(f"run directory does not exist: {path}")
+        run_dir = Path(run_dir)
+        manifest_path = run_dir / MANIFEST_FILENAME
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"no {MANIFEST_FILENAME} in {run_dir}; is this a valid run directory?"
+            )
 
-        phantom_path = path / PHANTOM_FILENAME
-        source_path = path / SOURCE_FILENAME
-        scanner_path = path / SCANNER_FILENAME
-        sinogram_path = path / SINOGRAM_FILENAME
-        manifest_path = path / MANIFEST_FILENAME
+        with open(manifest_path) as f:
+            manifest = yaml.safe_load(f) or {}
 
-        for p in (phantom_path, source_path, scanner_path):
-            if not p.exists():
-                raise FileNotFoundError(
-                    f"missing required file for run at {path}: {p.name}"
-                )
-
-        phantom = Phantom.load(phantom_path)
-        source = Source.load(source_path)
-        scanner = Scanner.load(scanner_path)
+        phantom = Phantom.load(run_dir / PHANTOM_FILENAME)
+        source = Source.load(run_dir / SOURCE_FILENAME)
+        scanner = Scanner.load(run_dir / SCANNER_FILENAME)
 
         sinogram: Sinogram | None = None
-        if sinogram_path.exists():
-            sinogram = Sinogram.load(sinogram_path, scanner=scanner)
+        has_sinogram = manifest.get("has_sinogram", False)
+        if has_sinogram:
+            sino_path = run_dir / SINOGRAM_FILENAME
+            if not sino_path.exists():
+                raise FileNotFoundError(
+                    f"manifest claims sinogram present but {SINOGRAM_FILENAME} "
+                    f"is missing in {run_dir}"
+                )
+            sinogram = Sinogram.load(sino_path, scanner=scanner)
 
-        manifest: dict[str, Any] = {}
-        if manifest_path.exists():
-            with open(manifest_path) as f:
-                loaded = yaml.safe_load(f)
-                if loaded is not None:
-                    manifest = loaded
+        # Strip bookkeeping fields from the user-facing metadata.
+        # Seed is promoted to a first-class field on Run.
+        seed = manifest.get("seed", None)
+        metadata = {
+            k: v for k, v in manifest.items()
+            if k not in ("has_sinogram", "files", "seed")
+        }
 
         return cls(
-            path=path,
             phantom=phantom,
             source=source,
             scanner=scanner,
             sinogram=sinogram,
-            manifest=manifest,
+            seed=seed,
+            metadata=metadata,
         )
 
-    # ---- introspection ------------------------------------------------
-
-    def has_sinogram(self) -> bool:
-        """True if this run has a sinogram (i.e. the simulator ran
-        successfully and produced output).
-        """
-        return self.sinogram is not None
-
-    def __repr__(self) -> str:
-        sino_str = "with sinogram" if self.has_sinogram() else "no sinogram"
-        backend = self.manifest.get("backend", "?")
-        return (
-            f"Run(path={str(self.path)!r}, "
-            f"phantom={self.phantom.shape}, "
-            f"scanner={self.scanner.name!r}, "
-            f"backend={backend}, {sino_str})"
-        )
-
-    # ---- equality -----------------------------------------------------
+    # ---- equality / repr ---------------------------------------------
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Run):
             return NotImplemented
+
+        # Compare metadata without the auto-populated bookkeeping fields,
+        # so two Runs that were saved at different times can still be
+        # considered equal if their actual content matches.
+        def strip(d: dict) -> dict:
+            return {
+                k: v for k, v in d.items()
+                if k not in ("created_at", "has_sinogram", "files")
+            }
+
         return (
             self.phantom == other.phantom
             and self.source == other.source
             and self.scanner == other.scanner
             and self.sinogram == other.sinogram
-            and self.manifest == other.manifest
+            and self.seed == other.seed
+            and strip(self.metadata) == strip(other.metadata)
+        )
+
+    def __repr__(self) -> str:
+        sino_part = (
+            f"sinogram={self.sinogram!r}" if self.sinogram is not None
+            else "sinogram=None"
+        )
+        return (
+            f"Run(phantom={self.phantom.shape}, "
+            f"source={self.source.isotope} {self.source.total_activity_Bq:.3g} Bq, "
+            f"scanner={self.scanner.name!r}, "
+            f"{sino_part})"
         )
