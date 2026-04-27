@@ -10,6 +10,7 @@ This script demonstrates the complete pipeline:
   6. Parse output sinogram
 """
 
+from pathlib import Path
 from petsim import Phantom, Source, Scanner, Run
 from petsim.backends import MCGPUBackend
 
@@ -44,16 +45,9 @@ print(f"Source: {source}")
 # Step 3: Define the scanner (detector geometry + binning)
 # ============================================================================
 scanner = Scanner.from_preset("mcgpu_sample")
-
-# CRITICAL: The preset has n_z_slices=159 (input parameter to MCGPU-PET),
-# but MCGPU-PET's span compression produces 1293 output slices.
-# This must match what the simulator actually outputs, or parsing fails.
-# scanner.n_z_slices = 1293
-scanner.n_z_slices = 18303
-
-
+# Use the preset as-is; no manual n_z_slices override needed.
+# The parser will auto-detect the output shape.
 print(f"Scanner: {scanner}")
-print(f"Sinogram shape: {scanner.sinogram_shape}")
 
 # ============================================================================
 # Step 4: Bundle into a Run
@@ -83,16 +77,29 @@ print("="*70)
 # Step 6: Inspect the output
 # ============================================================================
 print(f"\nSinogram: {sinogram}")
+print(f"  Sinogram shape: {sinogram.shape}")
 print(f"  Total trues: {sinogram.total_trues}")
 print(f"  Total scatter: {sinogram.total_scatter}")
 if sinogram.scatter_fraction is not None:
     print(f"  Scatter fraction: {sinogram.scatter_fraction:.1%}")
+
 print(f"\nWall time: {result.wall_time_s:.2f} s")
 print(f"Return code: {result.returncode}")
 
 # ============================================================================
-# Step 7: Save for later use
+# Step 7: Access the arrays directly for ML
 # ============================================================================
-run.sinogram = sinogram
-run.save(WORK_DIR + "/saved")
-print(f"\nSaved run to" + WORK_DIR + "/saved")
+print("\n" + "="*70)
+print("Arrays for ML training:")
+print("="*70)
+print(f"trues shape:   {sinogram.trues.shape}, dtype: {sinogram.trues.dtype}")
+print(f"scatter shape: {sinogram.scatter.shape if sinogram.scatter is not None else None}")
+print(f"scatter dtype: {sinogram.scatter.dtype if sinogram.scatter is not None else None}")
+
+# Example: use directly for training
+trues_array = sinogram.trues      # shape (18303, 168, 147)
+scatter_array = sinogram.scatter  # shape (18303, 168, 147)
+print(f"\nReady for training:")
+print(f"  Input (total):  {trues_array.shape}")
+print(f"  Target (scatter): {scatter_array.shape}")
+print(f"  You can now train: model.fit(trues, scatter)")

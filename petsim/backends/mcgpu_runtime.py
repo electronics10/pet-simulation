@@ -230,19 +230,13 @@ class MCGPUBackend:
     ) -> Sinogram:
         """Parse MCGPU-PET's sinogram output files into a Sinogram object.
 
-        MCGPU-PET writes binary int32 arrays for trues and scatter, one
-        file each. File names follow the pattern seen in the sample
-        simulation: sinogram_Trues.raw (and .gz variants), with scatter
-        as a separate file when both are tallied.
-
-        The expected shape is (n_z, n_angular, n_radial) taken from
-        Scanner. Since MCGPU-PET's output sinogram may have a different
-        z-extent after span compression, the parser uses the file size
-        to deduce the actual z dimension and warns if it doesn't match
-        the Scanner's declared n_z_slices.
+        MCGPU-PET writes binary int32 arrays for trues and scatter.
+        Auto-detects the z-dimension from file size since span compression
+        can produce different output sizes than the input parameter.
         """
-        scanner = run.scanner
         workdir = invoke_result.workdir
+        n_angular = run.scanner.n_angular_bins
+        n_radial = run.scanner.n_radial_bins
 
         trues = self._read_sinogram_file(
             candidate_names=[
@@ -250,7 +244,8 @@ class MCGPUBackend:
                 "sino_Trues.raw", "sino_Trues.raw.gz",
             ],
             workdir=workdir,
-            expected_shape=scanner.sinogram_shape,
+            n_angular=n_angular,
+            n_radial=n_radial,
         )
         scatter = self._read_sinogram_file(
             candidate_names=[
@@ -258,15 +253,16 @@ class MCGPUBackend:
                 "sino_Scatter.raw", "sino_Scatter.raw.gz",
             ],
             workdir=workdir,
-            expected_shape=scanner.sinogram_shape,
+            n_angular=n_angular,
+            n_radial=n_radial,
             optional=True,
         )
 
+        sinogram_shape = trues.shape
         return Sinogram(
-            scanner=scanner,
-            trues=trues.astype(np.float32),
-            scatter=scatter.astype(np.float32) if scatter is not None else None,
-            randoms=None,
+            trues=trues,
+            scatter=scatter,
+            shape=sinogram_shape,
             metadata={
                 "backend": "mcgpu",
                 "wall_time_s": invoke_result.wall_time_s,
@@ -278,14 +274,15 @@ class MCGPUBackend:
     def _read_sinogram_file(
         candidate_names: list[str],
         workdir: Path,
-        expected_shape: tuple[int, int, int],
+        n_angular: int,
+        n_radial: int,
         optional: bool = False,
     ) -> Optional[np.ndarray]:
         """Read a sinogram binary file, auto-detecting .gz compression.
 
-        Returns an int32 ndarray of shape expected_shape. Raises if the
-        file size doesn't match — callers need to fix Scanner.n_z_slices
-        or Scanner.binning_convention rather than silently reshaping.
+        Auto-detects the z-dimension from file size. Returns an int32
+        ndarray of shape (n_z, n_angular, n_radial) where n_z is inferred
+        from the file size.
         """
         path = None
         for name in candidate_names:
@@ -308,23 +305,18 @@ class MCGPUBackend:
             raw = path.read_bytes()
 
         arr = np.frombuffer(raw, dtype=np.int32)
-        n_elements = int(np.prod(expected_shape))
-        if arr.size != n_elements:
-            # Most likely cause: Scanner.n_z_slices doesn't match what
-            # MCGPU-PET's span compression actually produced. Surface
-            # enough info for the user to adjust.
-            _, ny, nx = expected_shape
-            hint = ""
-            if arr.size % (ny * nx) == 0:
-                hint = (f" (file is consistent with shape "
-                        f"({arr.size // (ny * nx)}, {ny}, {nx}) — "
-                        f"adjust Scanner.n_z_slices accordingly)")
+
+        # Auto-detect n_z from file size
+        if arr.size % (n_angular * n_radial) != 0:
             raise ValueError(
-                f"Sinogram file {path.name} has {arr.size} int32 elements "
-                f"but Scanner expects {n_elements} "
-                f"(shape {expected_shape}){hint}"
+                f"Sinogram file {path.name} has {arr.size} int32 elements, "
+                f"which is not divisible by n_angular*n_radial "
+                f"({n_angular}*{n_radial}={n_angular*n_radial}). "
+                f"The file may be corrupt or the scanner binning parameters are wrong."
             )
-        return arr.reshape(expected_shape).copy()
+
+        n_z = arr.size // (n_angular * n_radial)
+        return arr.reshape((n_z, n_angular, n_radial)).copy()
 
     # ------------------------------------------------------------------
     # Convenience: full pipeline in one call
