@@ -1,105 +1,82 @@
 """
-Minimal working script to generate one PET sinogram.
+Minimal working script with the refactored Scanner + MCGPUConfig split.
 
-This script demonstrates the complete pipeline:
-  1. Define phantom (geometry)
-  2. Define source (activity)
-  3. Define scanner (detector)
-  4. Bundle into Run
-  5. Execute with MCGPUBackend
-  6. Parse output sinogram
+Scanner = hardware (radius, rings, energy window, ...)
+MCGPUConfig = MCGPU's runtime knobs + sinogram binning (span, MRD, bins)
+
+Use the default MCGPUConfig for the mcgpu_sample scanner. For the Bruker
+scanner, override the binning to something sensible for 24 rings.
 """
 
-from pathlib import Path
 from petsim import Phantom, Source, Scanner, Run
-from petsim.backends import MCGPUBackend
+from petsim.backends import MCGPUBackend, MCGPUConfig
 
 WORK_DIR = "./runs/test_01"
 
 # ============================================================================
-# Step 1: Define the phantom (geometry + materials)
+# Phantom + Source (unchanged)
 # ============================================================================
 phantom = Phantom.cube(
     shape=(9, 9, 9),
-    voxel_size=(1.0, 1.0, 1.0),       # cm per voxel
+    voxel_size=(1.0, 1.0, 1.0),
     inner_material="water",
     inner_density=1.0,
     outer_material="air",
     outer_density=0.0012,
     inner_size_vox=5,
 )
-print(f"Phantom: {phantom}")
-
-# ============================================================================
-# Step 2: Define the source (activity distribution)
-# ============================================================================
 source = Source.with_total_activity(
-    phantom,
-    material="water",
-    total_activity_Bq=1e6,
-    isotope="F18",
+    phantom, material="water", total_activity_Bq=1e6, isotope="F18"
 )
-print(f"Source: {source}")
 
 # ============================================================================
-# Step 3: Define the scanner (detector geometry + binning)
+# Scanner (hardware only — no binning fields anymore)
 # ============================================================================
 scanner = Scanner.from_preset("mcgpu_sample")
-# Use the preset as-is; no manual n_z_slices override needed.
-# The parser will auto-detect the output shape.
 print(f"Scanner: {scanner}")
 
 # ============================================================================
-# Step 4: Bundle into a Run
+# MCGPUConfig (binning + runtime knobs live here now)
 # ============================================================================
-run = Run(phantom=phantom, source=source, scanner=scanner, seed=42)
-print(f"Run: {run}")
+# Defaults are tuned for mcgpu_sample, so we just use them as-is.
+# For other scanners, override:
+#   config = MCGPUConfig(span=3, max_ring_difference=23,
+#                        n_radial_bins=32, n_angular_bins=32)
+config = MCGPUConfig()
+print(f"Config: span={config.span}, MRD={config.max_ring_difference}, "
+      f"bins=({config.n_angular_bins}, {config.n_radial_bins})")
 
 # ============================================================================
-# Step 5: Execute the simulation
+# Bundle and run
 # ============================================================================
+run = Run(phantom=phantom, source=source, scanner=scanner, seed=42)
+
 backend = MCGPUBackend(
     executable="./MCGPU-PET/MCGPU-PET.x",
     materials_dir="./MCGPU-PET/sample_simulation/materials",
 )
 
-print("\n" + "="*70)
-print("Running MCGPU-PET simulation...")
-print("="*70)
-
-sinogram, result = backend.run_full(run, workdir=WORK_DIR)
-
-print("\n" + "="*70)
-print("Simulation complete!")
-print("="*70)
+print("\nRunning MCGPU-PET simulation...")
+sinogram, result = backend.run_full(run, workdir=WORK_DIR, config=config)
 
 # ============================================================================
-# Step 6: Inspect the output
+# Inspect output
 # ============================================================================
 print(f"\nSinogram: {sinogram}")
-print(f"  Sinogram shape: {sinogram.shape}")
-print(f"  Total trues: {sinogram.total_trues}")
-print(f"  Total scatter: {sinogram.total_scatter}")
-if sinogram.scatter_fraction is not None:
-    print(f"  Scatter fraction: {sinogram.scatter_fraction:.1%}")
-
+print(f"  shape: {sinogram.shape}")
+print(f"  total trues: {sinogram.total_trues}")
+print(f"  total scatter: {sinogram.total_scatter}")
+print(f"  scatter fraction: {sinogram.scatter_fraction:.1%}")
 print(f"\nWall time: {result.wall_time_s:.2f} s")
-print(f"Return code: {result.returncode}")
 
 # ============================================================================
-# Step 7: Access the arrays directly for ML
+# Save the full run for later use
 # ============================================================================
-print("\n" + "="*70)
-print("Arrays for ML training:")
-print("="*70)
-print(f"trues shape:   {sinogram.trues.shape}, dtype: {sinogram.trues.dtype}")
-print(f"scatter shape: {sinogram.scatter.shape if sinogram.scatter is not None else None}")
-print(f"scatter dtype: {sinogram.scatter.dtype if sinogram.scatter is not None else None}")
+run.sinogram = sinogram
+run.save(WORK_DIR + "/saved")
+print(f"\nSaved run to {WORK_DIR}/saved/")
 
-# Example: use directly for training
-trues_array = sinogram.trues      # shape (18303, 168, 147)
-scatter_array = sinogram.scatter  # shape (18303, 168, 147)
+# Arrays for ML training
 print(f"\nReady for training:")
-print(f"  Input (total):  {trues_array.shape}")
-print(f"  Target (scatter): {scatter_array.shape}")
-print(f"  You can now train: model.fit(trues, scatter)")
+print(f"  trues:   {sinogram.trues.shape} {sinogram.trues.dtype}")
+print(f"  scatter: {sinogram.scatter.shape} {sinogram.scatter.dtype}")

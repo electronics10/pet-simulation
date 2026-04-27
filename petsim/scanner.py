@@ -1,47 +1,27 @@
 """
-Scanner: PET scanner geometry and acquisition parameters.
+Scanner: PET scanner hardware specification.
 
-A Scanner describes the *measurement system* — the forward model A in the
-inverse problem y = A(x). It captures everything needed to interpret what
-each sinogram bin means physically: detector geometry, energy window,
-timing resolution, sinogram binning convention, and normalization
-assumptions.
+A Scanner describes ONLY the physical hardware: detector geometry, energy
+window, timing resolution, and crystal-level layout. It deliberately does
+NOT include sinogram binning parameters (radial bins, angular bins, span,
+MRD), because those are *choices about how to histogram the data*, not
+properties of the scanner itself. The same physical scanner can produce
+sinograms with many different binning conventions.
 
-Making A explicit matters because two scanners with the same geometry can
-still produce incompatible sinograms if they disagree about:
-
-  - how LORs are indexed (the binning convention)
-  - whether TOF information is preserved
-  - whether the sinogram has been normalized or attenuation-corrected
-
-Every Scanner therefore carries three fields that force the forward-model
-assumptions to be written down, not assumed:
-
-  - binning_convention: free-form string identifying the LOR indexing
-    scheme, e.g. "mcgpu_span11_mrd79" or "gate_listmode". Two sinograms
-    with different binning_convention values are NOT directly comparable.
-  - tof_enabled: whether the measurement preserves arrival-time info.
-  - normalization: what corrections have been applied to the sinogram.
+Backends own the binning:
+  - MCGPU-PET: see MCGPUConfig in petsim/backends/mcgpu.py
+  - GATE: see GATEConfig in petsim/backends/gate.py
 
 Two levels of detail are supported:
 
-  1. Idealized cylinder — the level MCGPU-PET operates at. A scanner is
-     a cylindrical detector with a radius, axial length, and energy
-     window. This is the minimum information needed to run an MCGPU-PET
-     simulation.
+  1. Idealized cylinder — minimum needed for MCGPU-PET. A scanner is a
+     cylindrical detector with a radius, axial length, and energy window.
 
   2. Full crystal geometry — optional fields describing the crystal /
-     module / rsector structure. These are needed to translate into
-     GATE's detailed geometry tree.
+     module / rsector structure. Required for GATE's detailed geometry tree.
 
-Sinogram binning parameters (number of radial bins, angular bins, span,
-max ring difference) are part of the Scanner because different scanners
-bin their coincidences differently. Storing them here keeps the
-sinogram self-describing: you can always recover the physical meaning of
-a bin from the Scanner that produced it.
-
-Presets for known scanners (starting with Bruker Albira, from the
-existing gate-pet/bruker_pet_sim.py) live in SCANNER_PRESETS.
+Presets for known scanners (mcgpu_sample, bruker_albira) live in
+SCANNER_PRESETS at the bottom of this file.
 """
 
 from __future__ import annotations
@@ -55,18 +35,18 @@ import yaml
 
 @dataclass
 class Scanner:
-    """PET scanner geometry and acquisition parameters.
+    """PET scanner hardware specification.
 
-    Minimum-required fields for MCGPU-PET:
+    Required fields:
       - detector_radius_cm, detector_axial_length_cm
-      - energy_window_keV
-      - energy_resolution
+      - n_rings, n_crystals_per_ring (the detector ring structure)
+      - energy_window_keV, energy_resolution
       - acquisition_time_s
-      - sinogram binning parameters
 
-    Optional fields for GATE (and descriptive purposes):
-      - crystal geometry (size, material)
-      - module / rsector layout
+    Optional fields:
+      - coincidence_window_ns (timing)
+      - crystal-level geometry (size, material, module/rsector layout)
+        — needed for GATE
     """
 
     # ---- Identification ------------------------------------------------
@@ -76,6 +56,10 @@ class Scanner:
     detector_radius_cm: float          # inner radius of the detector ring
     detector_axial_length_cm: float    # axial extent of the detector
 
+    # ---- Detector ring structure (required) ----------------------------
+    n_rings: int                       # number of detector rings stacked axially
+    n_crystals_per_ring: int           # crystals distributed around one ring
+
     # ---- Physics window (required) -------------------------------------
     energy_window_keV: tuple[float, float]  # (low, high) coincidence window
     energy_resolution: float                # fractional FWHM at 511 keV (e.g. 0.12)
@@ -83,32 +67,8 @@ class Scanner:
     # ---- Acquisition (required) ----------------------------------------
     acquisition_time_s: float          # total simulated / real scan time
 
-    # ---- Sinogram binning (required) -----------------------------------
-    n_radial_bins: int                 # "NRAD" in MCGPU-PET
-    n_angular_bins: int                # "NANGLES"
-    n_z_slices: int                    # total slices in 3D sinogram
-    span: int                          # axial compression (Michelogram span)
-    max_ring_difference: int           # "MRD"
-
-    # ---- Forward-model assumptions (required for comparability) --------
-    # These three fields make the "A" in y = A(x) explicit. Two sinograms
-    # with different values here are NOT directly comparable, even if all
-    # the geometry numbers match. See module docstring for rationale.
-    binning_convention: str = "unspecified"
-    tof_enabled: bool = False
-    normalization: str = "none"         # "none" | "attenuation_corrected" | ...
-
     # ---- Coincidence timing (optional) ---------------------------------
     coincidence_window_ns: float | None = None
-
-    # ---- Detector ring structure (optional, required for MCGPU-PET) ----
-    # Number of detector rings stacked axially. Called "NUMBER OF ROWS"
-    # in MCGPU-PET's .in file.
-    n_rings: int | None = None
-    # Crystals distributed around one ring. Called "TOTAL NUMBER OF CRYSTALS"
-    # in MCGPU-PET's .in file (confusingly — it's per-ring, not total).
-    # Typically equals 2 * n_angular_bins for sinograms with full 2π coverage.
-    n_crystals_per_ring: int | None = None
 
     # ---- Crystal-level geometry (optional, for GATE) -------------------
     crystal_size_mm: tuple[float, float, float] | None = None
@@ -118,8 +78,6 @@ class Scanner:
     n_rsectors: int | None = None
 
     # ---- Free-form backend hints ---------------------------------------
-    # Useful for storing scanner-specific parameters that don't fit the
-    # general schema, e.g. MCGPU-PET's NSEG or NBINS.
     extra: dict[str, Any] = field(default_factory=dict)
 
     # ---- validation ---------------------------------------------------
@@ -133,6 +91,12 @@ class Scanner:
             raise ValueError(
                 f"detector_axial_length_cm must be positive; "
                 f"got {self.detector_axial_length_cm}"
+            )
+        if self.n_rings <= 0:
+            raise ValueError(f"n_rings must be positive; got {self.n_rings}")
+        if self.n_crystals_per_ring <= 0:
+            raise ValueError(
+                f"n_crystals_per_ring must be positive; got {self.n_crystals_per_ring}"
             )
         if self.acquisition_time_s <= 0:
             raise ValueError(
@@ -152,69 +116,19 @@ class Scanner:
                 f"got {self.energy_resolution}"
             )
 
-        for name, value in (
-            ("n_radial_bins", self.n_radial_bins),
-            ("n_angular_bins", self.n_angular_bins),
-            ("n_z_slices", self.n_z_slices),
-            ("span", self.span),
-            ("max_ring_difference", self.max_ring_difference),
-        ):
-            if value <= 0:
-                raise ValueError(f"{name} must be positive; got {value}")
-
         if self.coincidence_window_ns is not None and self.coincidence_window_ns <= 0:
             raise ValueError(
                 f"coincidence_window_ns must be positive if provided; "
                 f"got {self.coincidence_window_ns}"
             )
 
-        # Validate normalization against known values. Expand this list
-        # as real normalization pipelines are implemented.
-        allowed_normalizations = {
-            "none",
-            "attenuation_corrected",
-            "normalization_corrected",
-            "scatter_corrected",
-            "fully_corrected",
-        }
-        if self.normalization not in allowed_normalizations:
-            raise ValueError(
-                f"unknown normalization {self.normalization!r}; "
-                f"allowed: {sorted(allowed_normalizations)}"
-            )
-
     # ---- convenience --------------------------------------------------
-
-    @property
-    def sinogram_shape(self) -> tuple[int, int, int]:
-        """Canonical sinogram shape (n_z_slices, n_angular_bins, n_radial_bins).
-
-        This ordering matches what we used in the earlier visualization
-        scripts: sinogram[slice, angle, radial].
-        """
-        return (self.n_z_slices, self.n_angular_bins, self.n_radial_bins)
 
     @property
     def energy_window_eV(self) -> tuple[float, float]:
         """Energy window in eV (MCGPU-PET's native unit)."""
         lo, hi = self.energy_window_keV
         return (lo * 1000.0, hi * 1000.0)
-
-    def is_compatible_with(self, other: "Scanner") -> bool:
-        """Check whether sinograms from two scanners are directly
-        comparable bin-for-bin.
-
-        Comparability requires identical sinogram shape AND identical
-        forward-model assumptions (binning convention, TOF, normalization).
-        Two scanners can share geometry but be incompatible if they
-        disagree on indexing or corrections.
-        """
-        return (
-            self.sinogram_shape == other.sinogram_shape
-            and self.binning_convention == other.binning_convention
-            and self.tof_enabled == other.tof_enabled
-            and self.normalization == other.normalization
-        )
 
     # ---- factories ----------------------------------------------------
 
@@ -225,7 +139,7 @@ class Scanner:
 
         Example:
             s = Scanner.from_preset("mcgpu_sample", acquisition_time_s=10)
-            s = Scanner.from_preset("mcgpu_sample", name="my_custom_run")
+            s = Scanner.from_preset("bruker_albira", name="my_custom_run")
         """
         if preset not in SCANNER_PRESETS:
             raise KeyError(
@@ -242,8 +156,6 @@ class Scanner:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = asdict(self)
-        # YAML doesn't round-trip tuples cleanly; convert to lists and
-        # convert back on load.
         for key, value in list(data.items()):
             if isinstance(value, tuple):
                 data[key] = list(value)
@@ -257,7 +169,6 @@ class Scanner:
         with open(path) as f:
             data = yaml.safe_load(f)
 
-        # Convert the fields that should be tuples back from lists.
         tuple_fields = {
             "energy_window_keV",
             "crystal_size_mm",
@@ -268,7 +179,6 @@ class Scanner:
             if key in data and data[key] is not None:
                 data[key] = tuple(data[key])
 
-        # Filter out any unknown keys defensively.
         known = {f.name for f in fields(cls)}
         data = {k: v for k, v in data.items() if k in known}
         return cls(**data)
@@ -285,65 +195,50 @@ class Scanner:
             f"Scanner({self.name!r}, "
             f"R={self.detector_radius_cm}cm, "
             f"L={self.detector_axial_length_cm}cm, "
+            f"rings={self.n_rings}x{self.n_crystals_per_ring}, "
             f"E=({self.energy_window_keV[0]}, {self.energy_window_keV[1]}) keV, "
-            f"T={self.acquisition_time_s}s, "
-            f"sino={self.sinogram_shape})"
+            f"T={self.acquisition_time_s}s)"
         )
 
 
 # =====================================================================
 # Scanner presets
 # =====================================================================
-# These mirror the parameters seen in the sample simulations we have.
-# Add more as they are needed.
 
 SCANNER_PRESETS: dict[str, dict[str, Any]] = {
     # Mirrors the MCGPU-PET sample_simulation/MCGPU-PET.in file.
-    # The sample is a toy geometry centered on a 9x9x9 cm phantom.
+    # Toy geometry centered on a 9x9x9 cm phantom.
     "mcgpu_sample": {
         "name": "mcgpu_sample",
         "detector_radius_cm": 9.05,
         "detector_axial_length_cm": 12.656,
+        "n_rings": 80,
+        "n_crystals_per_ring": 336,
         "energy_window_keV": (350.0, 600.0),
         "energy_resolution": 0.12,
         "acquisition_time_s": 1.0,
-        "n_radial_bins": 147,
-        "n_angular_bins": 168,
-        "n_z_slices": 159,       # input parameter; output sinogram has
-                                  # more slices after span compression
-        "span": 11,
-        "max_ring_difference": 79,
-        "binning_convention": "mcgpu_span11_mrd79",
-        "tof_enabled": False,
-        "normalization": "none",
-        "n_rings": 80,
-        "n_crystals_per_ring": 336,
     },
 
-    # Mirrors gate-pet/bruker_pet_sim.py:
-    #   - CylindricalPET, Rmax 82mm, Rmin 58mm, height 105mm
-    #   - LYSO, 10x10x10 mm crystals, 8x8 per module,
-    #   - 3 modules per rsector (axial), 8 rsectors (ring)
-    #   - Energy window 350-650 keV, coincidence 10 ns
-    # Sinogram parameters are placeholders for now; tune as needed when the
-    # GATE backend actually builds sinograms.
+    # Bruker small-animal PET scanner.
+    # Specs extracted from Bruker_PET1.mac (GATE 9.4.1):
+    #   - cylindricalPET: Rmax=82mm, Rmin=58mm, height=105mm
+    #   - rsector at x=67mm, crystal block 10x50x50 mm
+    #   - 8x8 crystals per module, 1x1x3 modules per rsector, 8 rsectors
+    #     → 24 rings axial, 64 crystals per ring
+    #   - LYSO crystals
+    #   - Energy window 350-650 keV, resolution 0.15 at 511 keV
+    #   - Coincidence window 10 ns
     "bruker_albira": {
         "name": "bruker_albira",
-        "detector_radius_cm": 5.8,
+        "detector_radius_cm": 6.2,         # crystal center at 67mm rsector + 10mm/2 - inner edge
         "detector_axial_length_cm": 10.5,
+        "n_rings": 24,                     # 8 crystals * 3 modules
+        "n_crystals_per_ring": 64,         # 8 crystals * 8 rsectors
         "energy_window_keV": (350.0, 650.0),
-        "energy_resolution": 0.12,
+        "energy_resolution": 0.15,
         "acquisition_time_s": 1.0,
-        "n_radial_bins": 128,
-        "n_angular_bins": 128,
-        "n_z_slices": 63,
-        "span": 3,
-        "max_ring_difference": 31,
-        "binning_convention": "gate_span3_mrd31",
-        "tof_enabled": False,
-        "normalization": "none",
         "coincidence_window_ns": 10.0,
-        "crystal_size_mm": (10.0, 6.0, 6.0),
+        "crystal_size_mm": (10.0, 6.25, 6.25),  # 50mm / 8 crystals
         "crystal_material": "LYSO",
         "crystals_per_module": (8, 8),
         "modules_per_rsector": (1, 1, 3),

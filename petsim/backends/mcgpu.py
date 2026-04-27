@@ -8,14 +8,10 @@ This module provides the input-side of the MCGPU-PET backend:
     phantom format.
 
   - `write_in(run, materials, vox_filename, config, path)` produces the
-    .in control file MCGPU-PET reads at startup. NOT byte-exact to the
-    distributed sample (the sample has a placeholder isotope mean life
-    and dose-ROI values left over from a larger phantom), but functionally
-    correct: the file is structured so MCGPU-PET's section-based parser
-    accepts it and uses the values from the Run.
+    .in control file MCGPU-PET reads at startup. Functionally correct
+    for MCGPU-PET's section-based parser.
 
-The executable invocation and output parsing live in later modules. This
-one is pure file generation.
+The executable invocation and output parsing live in mcgpu_runtime.py.
 """
 
 from __future__ import annotations
@@ -33,16 +29,6 @@ from ..source import Source
 # =====================================================================
 # .vox file format
 # =====================================================================
-#
-# The header is a fixed 7-line block whose exact whitespace matters: the
-# MCGPU-PET parser reads specific columns. The body is one line per voxel
-# in the order X-fastest, then Y, then Z, with a single blank line at the
-# end of each X-row and a single blank line at the end of each Y-cycle
-# (i.e. two blank lines between Z-slices).
-#
-# The header declares "BLANK LINES AT END OF X,Y-CYCLES" = 1, and the
-# writer honors that consistently: trailing blanks after the last voxel
-# are the normal end-of-X and end-of-Y markers, no more, no less.
 
 VOX_HEADER_TEMPLATE = """\
 [SECTION VOXELS HEADER v.2008-04-13]
@@ -68,13 +54,6 @@ def write_vox(
         {material_id} {density_g_per_cm3} {activity_Bq}
 
     Iteration order is X fastest (innermost), then Y, then Z (slowest).
-    A single blank line is written at the end of each X-row, and an
-    additional blank line at the end of each Y-cycle — so two blank
-    lines separate consecutive Z-slices.
-
-    Material IDs are 1-indexed and must correspond to the order in which
-    the .mcgpu.gz material files are listed in the companion .in file.
-    The Phantom and Source must share the same voxel grid.
     """
     if not source.matches(phantom):
         raise ValueError(
@@ -86,11 +65,6 @@ def write_vox(
     nx, ny, nz = phantom.shape
     dx, dy, dz = phantom.voxel_size
 
-    # Format floats through Python's short-repr: `f"{float(...)}"` gives
-    # '1.0', '0.0012', '50.0' etc. This matches the reference format's
-    # natural float representations. Requires densities and activities
-    # to be stored as float64 so round-trip through `float()` preserves
-    # the exact value.
     parts: list[str] = [
         VOX_HEADER_TEMPLATE.format(
             nx=nx, ny=ny, nz=nz,
@@ -111,34 +85,31 @@ def write_vox(
                 parts.append(f"{mid} {den} {act}\n")
             parts.append("\n")  # end of X-cycle
         parts.append("\n")      # end of Y-cycle
-    parts.append("\n")          # trailing blank at EOF — matches the
-                                # reference phantom_9x9x9cm.vox, which
-                                # ends with 3 blank lines after the last
-                                # voxel line (end-of-X + end-of-Y + EOF).
+    parts.append("\n")          # trailing blank at EOF
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(parts))
 
 
 # =====================================================================
-# .in file format
+# .in file format and configuration
 # =====================================================================
 #
-# Backend-specific runtime parameters that aren't intrinsic scanner
-# properties (GPU number, reporting mode, dose-tally toggles, output
-# resolution) live in this config. Defaults mirror the MCGPU-PET sample
-# simulation so that an empty MCGPUConfig() plus a well-populated Scanner
-# produces a reasonable .in file.
+# MCGPU-PET-specific runtime parameters AND sinogram binning live in this
+# config. Binning belongs here (not in Scanner) because it's a choice
+# about how to histogram coincidences, not a property of the scanner
+# hardware. Two MCGPU runs of the same scanner can use different binning.
 
 
 @dataclass
 class MCGPUConfig:
-    """MCGPU-PET-specific runtime parameters.
+    """MCGPU-PET-specific runtime parameters and sinogram binning.
 
-    These live in their own dataclass (rather than in Scanner) because
-    they describe simulator behavior, not the scanner itself. A single
-    Scanner might be driven by many different MCGPUConfig values
-    (different reporting modes, different output resolutions).
+    Defaults mirror the MCGPU-PET sample simulation, which is designed
+    for the mcgpu_sample scanner preset (80 rings, 336 crystals/ring).
+    For other scanners, you'll typically want to override at least
+    n_radial_bins, n_angular_bins, span, and max_ring_difference to
+    sensible values for that geometry.
     """
 
     # ---- GPU / perf knobs --------------------------------------------
@@ -150,18 +121,25 @@ class MCGPUConfig:
     psf_filename: str = "MCGPU_PET.psf"
     psf_size: int = 150_000_000
 
-    # Coincidence filter (sample default: 0 = both trues and scatter)
-    # 0 = both, 1 = trues only, 2 = scatter only
+    # Coincidence filter: 0=both trues+scatter, 1=trues only, 2=scatter only
     report_coincidence_mode: int = 0
 
-    # Output file selection (sample default: 0 = both PSF and sinogram)
-    # 0 = both, 1 = PSF only, 2 = sinogram only
+    # Output file selection: 0=both PSF+sinogram, 1=PSF only, 2=sinogram only
     report_output_mode: int = 0
 
     # ---- Dose tally --------------------------------------------------
     tally_material_dose: bool = True
     tally_voxel_dose: bool = False
     dose_output_filename: str = "mc-gpu_dose.dat"
+
+    # ---- Sinogram binning --------------------------------------------
+    # These control how MCGPU-PET histograms coincidences. They are
+    # intentionally independent of the Scanner: the same scanner can
+    # produce sinograms with different binning conventions.
+    n_radial_bins: int = 147           # NRAD
+    n_angular_bins: int = 168          # NANGLES = NCRYSTALS/2 typically
+    span: int = 11                     # Michelogram span
+    max_ring_difference: int = 79      # MRD
 
     # ---- Output voxel image resolution -------------------------------
     image_resolution: int = 128   # bins per axis in the emission image
@@ -250,11 +228,9 @@ def write_in(
 ) -> None:
     """Write an MCGPU-PET .in control file from a Run + MaterialRegistry.
 
-    This file is NOT byte-exact to the MCGPU-PET sample_simulation/.in
-    — the sample contains a placeholder isotope mean life (70000 s, not
-    matching any standard isotope) and leftover dose-ROI values from a
-    different phantom. The output here is functionally correct: MCGPU-PET
-    will parse it and simulate using the Run's actual values.
+    The Scanner provides hardware specs (rings, geometry, energy window).
+    The MCGPUConfig provides binning and runtime knobs. NUMBER OF Z SLICES
+    is computed from the scanner's n_rings as 2*n_rings - 1.
 
     Parameters
     ----------
@@ -264,16 +240,13 @@ def write_in(
         Resolves the phantom's material names to .mcgpu.gz files.
     vox_filename : str
         Relative path (as written into the .in file) to the .vox file.
-        The .in file's working directory must be such that this path
-        resolves when MCGPU-PET opens it.
     config : MCGPUConfig, optional
-        Backend-specific knobs. Defaults are a faithful mirror of the
-        MCGPU-PET sample simulation.
+        Backend-specific knobs and binning. Defaults are tuned for the
+        mcgpu_sample scanner preset.
     path : str or Path
         Where to write the .in file.
     petsim_tag : str
-        Free-form identifier written into the header comment. Useful
-        for traceability (e.g. git hash).
+        Free-form identifier written into the header comment.
     """
     if config is None:
         config = MCGPUConfig()
@@ -281,18 +254,6 @@ def write_in(
     scanner = run.scanner
     phantom = run.phantom
     source = run.source
-
-    # --- Required MCGPU-specific scanner fields ---
-    if scanner.n_rings is None:
-        raise ValueError(
-            "Scanner.n_rings must be set to use the MCGPU-PET backend "
-            "(this is the number of detector rings, i.e. 'NUMBER OF ROWS')."
-        )
-    if scanner.n_crystals_per_ring is None:
-        raise ValueError(
-            "Scanner.n_crystals_per_ring must be set to use the MCGPU-PET "
-            "backend (this is the number of crystals around one ring)."
-        )
 
     # --- Material file list, in material-ID order ---
     material_lines: list[str] = []
@@ -313,13 +274,17 @@ def write_in(
     # --- Seed: 0 means "use time-based" per MCGPU-PET convention ---
     seed_value = run.seed if run.seed is not None else 0
 
-    # --- Detector radius: negate so MCGPU auto-centers on voxel geometry.
-    #     This matches the sample's behavior (R=-9.05) and keeps the
-    #     phantom centered in the scanner without manual bookkeeping.
+    # --- Detector radius: negate so MCGPU auto-centers on voxel geometry ---
     detector_radius_signed = -float(scanner.detector_radius_cm)
 
     # --- Dose ROI spans the whole phantom ---
     nx, ny, nz = phantom.shape
+
+    # --- NUMBER OF Z SLICES is the input parameter to MCGPU-PET's
+    #     rebinning algorithm. The standard value is 2*n_rings - 1.
+    #     The actual output sinogram has many more z-planes after span
+    #     compression — that's auto-detected at parse time.
+    n_z_slices_input = 2 * scanner.n_rings - 1
 
     content = IN_TEMPLATE.format(
         petsim_tag=petsim_tag,
@@ -344,13 +309,13 @@ def write_in(
         energy_high_eV=float(e_high_eV),
         n_rings=scanner.n_rings,
         n_crystals_per_ring=scanner.n_crystals_per_ring,
-        n_angular_bins=scanner.n_angular_bins,
-        n_radial_bins=scanner.n_radial_bins,
-        n_z_slices=scanner.n_rings * 2 - 1,
+        n_angular_bins=config.n_angular_bins,
+        n_radial_bins=config.n_radial_bins,
+        n_z_slices=n_z_slices_input,
         image_resolution=config.image_resolution,
         n_energy_bins=config.n_energy_bins,
-        max_ring_difference=scanner.max_ring_difference,
-        span=scanner.span,
+        max_ring_difference=config.max_ring_difference,
+        span=config.span,
         vox_filename=vox_filename,
         material_files_block=material_files_block,
     )

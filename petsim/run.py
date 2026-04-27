@@ -7,23 +7,15 @@ A Run represents one end-to-end simulation bundle:
     A (forward model) = Scanner
     y (measurement)   = Sinogram
 
-All four components plus a manifest live in a single directory following
-the storage format from PLAN.md:
+All four components plus a manifest live in a single directory:
 
     runs/001_water_cylinder/
     ├── run.yaml          ← manifest: backend, seed, git hash, wall time, counts
     ├── phantom.npz       ← x (geometry + materials)
     ├── source.npz        ← x (activity distribution)
-    ├── scanner.yaml      ← A (forward model)
-    ├── sinogram.npz      ← y (measurement, backend-agnostic format)
+    ├── scanner.yaml      ← A (forward model — hardware spec)
+    ├── sinogram.npz      ← y (measurement)
     └── simulator_output/ ← raw backend-specific outputs (not loaded by Run)
-
-The `Run` class is the top-level API for saving / loading an entire
-simulation. Backends (Phase 2+) produce `Run` objects; downstream code
-(analysis, DL training) consumes them.
-
-This module has no backend-specific logic — backends call `Run.save` after
-they finish running the simulator.
 """
 
 from __future__ import annotations
@@ -41,8 +33,6 @@ from .sinogram import Sinogram
 from .source import Source
 
 
-# File names inside a run directory. Kept as module-level constants so
-# backends and tests can reference them consistently.
 MANIFEST_FILENAME = "run.yaml"
 PHANTOM_FILENAME = "phantom.npz"
 SOURCE_FILENAME = "source.npz"
@@ -62,24 +52,13 @@ class Run:
     source : Source
         Ground truth radioactivity distribution.
     scanner : Scanner
-        Forward model — scanner geometry and binning.
-    sinogram : Sinogram
-        Measurement — coincidence histograms. None if the simulation has
-        not been run yet (a prepared-but-unrun bundle).
+        Hardware spec — scanner geometry, energy window, etc.
+    sinogram : Sinogram | None
+        Measurement. None if not yet simulated.
     seed : int | None
-        RNG seed used for this run. First-class field because
-        reproducibility is critical for ML: the same seed must produce
-        statistically identical output, and changing the seed is the
-        standard way to generate noise-pair datasets. Backends are
-        responsible for actually feeding this seed to the simulator.
+        RNG seed for reproducibility.
     metadata : dict
-        Free-form manifest fields. Backends populate:
-          - backend: "mcgpu" | "gate"
-          - wall_time_seconds: float
-          - git_hash: str
-          - created_at: ISO 8601 string
-          - simulator_version: str
-          - plus anything the backend wants to record
+        Free-form manifest fields (backend, wall_time_seconds, git_hash, ...).
     """
 
     phantom: Phantom
@@ -89,8 +68,6 @@ class Run:
     seed: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    # ---- validation ---------------------------------------------------
-
     def __post_init__(self) -> None:
         if not self.source.matches(self.phantom):
             raise ValueError(
@@ -98,24 +75,11 @@ class Run:
                 f"does not match phantom grid {self.phantom.shape} "
                 f"{self.phantom.voxel_size} cm"
             )
-        if self.sinogram is not None and self.sinogram.scanner != self.scanner:
-            raise ValueError(
-                "sinogram.scanner does not match run.scanner; "
-                "did you accidentally pass a mismatched scanner?"
-            )
 
     # ---- persistence --------------------------------------------------
 
     def save(self, run_dir: str | Path) -> None:
-        """Write the entire run to a directory following the storage format.
-
-        Creates `run_dir` if it doesn't exist. Does not touch
-        `simulator_output/` — backends write that themselves during or
-        before calling save().
-
-        If `sinogram` is None, no sinogram.npz file is written, and the
-        manifest records `has_sinogram: false`.
-        """
+        """Write the entire run to a directory."""
         run_dir = Path(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,7 +89,6 @@ class Run:
         if self.sinogram is not None:
             self.sinogram.save(run_dir / SINOGRAM_FILENAME)
 
-        # Build the manifest. Always populate created_at if not provided.
         manifest = dict(self.metadata)
         manifest.setdefault("created_at", datetime.now().isoformat())
         manifest["seed"] = self.seed
@@ -142,12 +105,7 @@ class Run:
 
     @classmethod
     def load(cls, run_dir: str | Path) -> "Run":
-        """Load a complete run from a directory produced by save().
-
-        The manifest's has_sinogram flag determines whether sinogram.npz
-        is read. If the file is missing but has_sinogram is true, an
-        error is raised.
-        """
+        """Load a complete run from a directory produced by save()."""
         run_dir = Path(run_dir)
         manifest_path = run_dir / MANIFEST_FILENAME
         if not manifest_path.exists():
@@ -171,10 +129,8 @@ class Run:
                     f"manifest claims sinogram present but {SINOGRAM_FILENAME} "
                     f"is missing in {run_dir}"
                 )
-            sinogram = Sinogram.load(sino_path, scanner=scanner)
+            sinogram = Sinogram.load(sino_path)
 
-        # Strip bookkeeping fields from the user-facing metadata.
-        # Seed is promoted to a first-class field on Run.
         seed = manifest.get("seed", None)
         metadata = {
             k: v for k, v in manifest.items()
@@ -190,15 +146,10 @@ class Run:
             metadata=metadata,
         )
 
-    # ---- equality / repr ---------------------------------------------
-
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Run):
             return NotImplemented
 
-        # Compare metadata without the auto-populated bookkeeping fields,
-        # so two Runs that were saved at different times can still be
-        # considered equal if their actual content matches.
         def strip(d: dict) -> dict:
             return {
                 k: v for k, v in d.items()
@@ -209,7 +160,6 @@ class Run:
             self.phantom == other.phantom
             and self.source == other.source
             and self.scanner == other.scanner
-            and self.sinogram == other.sinogram
             and self.seed == other.seed
             and strip(self.metadata) == strip(other.metadata)
         )
