@@ -73,6 +73,14 @@ _DEFAULT_MATERIALS: tuple[Material, ...] = (
     Material("air",   0.00120,  "air_5-515keV.mcgpu.gz",                       "G4_AIR"),
     Material("water", 1.00000,  "water_5-515keV.mcgpu.gz",                     "G4_WATER"),
 
+    # Crystal scintillators (GATE only — no MCGPU cross-section files for these;
+    # mcgpu_file is a placeholder and will raise FileNotFoundError if MCGPU
+    # tries to use them, which it shouldn't since crystals are the detector,
+    # not part of the phantom.)
+    Material("lyso", 7.10000, "lyso.mcgpu.gz", "LYSO"),
+    Material("lso",  7.40000, "lso.mcgpu.gz",  "LSO"),
+    Material("bgo",  7.13000, "bgo.mcgpu.gz",  "BGO"),
+
     # ICRP 110 tissues
     Material("adipose",            0.95000, "adipose_ICRP110_5-515keV.mcgpu.gz",            "G4_ADIPOSE_TISSUE_ICRP"),
     Material("blood",              1.06000, "blood_spleen_ICRP110_5-515keV.mcgpu.gz",       "G4_BLOOD_ICRP"),
