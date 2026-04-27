@@ -97,6 +97,7 @@ pet-simulation/
 
 ```bash
 git clone https://github.com/electronics10/pet-simulation.git
+cd pet-simulation
 uv sync
 ```
 
