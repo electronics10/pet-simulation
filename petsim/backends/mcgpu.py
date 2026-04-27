@@ -346,7 +346,7 @@ def write_in(
         n_crystals_per_ring=scanner.n_crystals_per_ring,
         n_angular_bins=scanner.n_angular_bins,
         n_radial_bins=scanner.n_radial_bins,
-        n_z_slices=scanner.n_z_slices,
+        n_z_slices=scanner.n_rings * 2 - 1,
         image_resolution=config.image_resolution,
         n_energy_bins=config.n_energy_bins,
         max_ring_difference=scanner.max_ring_difference,
