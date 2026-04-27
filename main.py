@@ -1,20 +1,20 @@
 """
-Minimal working script with the refactored Scanner + MCGPUConfig split.
+Minimal working example with the cleanly-separated API.
 
-Scanner = hardware (radius, rings, energy window, ...)
-MCGPUConfig = MCGPU's runtime knobs + sinogram binning (span, MRD, bins)
+Three layers, all backend-agnostic:
+  1. Scanner       — hardware (radius, rings, energy window)
+  2. SinogramBinning — layout choice (span, MRD, n_radial, n_angular)
+  3. Run           — bundles everything, ready for any backend
 
-Use the default MCGPUConfig for the mcgpu_sample scanner. For the Bruker
-scanner, override the binning to something sensible for 24 rings.
+Backend-specific runtime (MCGPUConfig, GATEConfig) is the only thing
+backends define on their own.
 """
 
-from petsim import Phantom, Source, Scanner, Run
-from petsim.backends import MCGPUBackend, MCGPUConfig
-
-WORK_DIR = "./runs/test_01"
+from petsim import Phantom, Source, Scanner, SinogramBinning, Run
+from petsim.backends import MCGPUBackend
 
 # ============================================================================
-# Phantom + Source (unchanged)
+# Define the simulation — backend-agnostic
 # ============================================================================
 phantom = Phantom.cube(
     shape=(9, 9, 9),
@@ -25,58 +25,62 @@ phantom = Phantom.cube(
     outer_density=0.0012,
     inner_size_vox=5,
 )
+
 source = Source.with_total_activity(
     phantom, material="water", total_activity_Bq=1e6, isotope="F18"
 )
 
-# ============================================================================
-# Scanner (hardware only — no binning fields anymore)
-# ============================================================================
+# Hardware: backend-agnostic
 scanner = Scanner.from_preset("mcgpu_sample")
+
+# Layout: backend-agnostic. The "default_for" factory works for any scanner.
+# binning = SinogramBinning.default_for(scanner)  # works for any scanner
+
+# For the mcgpu_sample, use the canonical layout it was designed for:
+from petsim.sinogram_binning import preset_binning
+binning = preset_binning("mcgpu_sample")
+
+# Bundle
+run = Run(
+    phantom=phantom,
+    source=source,
+    scanner=scanner,
+    binning=binning,
+    seed=42,
+)
 print(f"Scanner: {scanner}")
+print(f"Binning: {binning}")
+print(f"Run: {run}")
 
 # ============================================================================
-# MCGPUConfig (binning + runtime knobs live here now)
+# Run with MCGPU
 # ============================================================================
-# Defaults are tuned for mcgpu_sample, so we just use them as-is.
-# For other scanners, override:
-#   config = MCGPUConfig(span=3, max_ring_difference=23,
-#                        n_radial_bins=32, n_angular_bins=32)
-config = MCGPUConfig()
-print(f"Config: span={config.span}, MRD={config.max_ring_difference}, "
-      f"bins=({config.n_angular_bins}, {config.n_radial_bins})")
-
-# ============================================================================
-# Bundle and run
-# ============================================================================
-run = Run(phantom=phantom, source=source, scanner=scanner, seed=42)
-
 backend = MCGPUBackend(
-    executable="./MCGPU-PET/MCGPU-PET.x",
-    materials_dir="./MCGPU-PET/sample_simulation/materials",
+    executable="./bin/MCGPU-PET.x",
+    materials_dir="./materials",
 )
 
-print("\nRunning MCGPU-PET simulation...")
-sinogram, result = backend.run_full(run, workdir=WORK_DIR, config=config)
+print("\nRunning simulation...")
+sinogram, result = backend.run_full(run, run_dir="./runs/0001")
 
-# ============================================================================
-# Inspect output
-# ============================================================================
 print(f"\nSinogram: {sinogram}")
-print(f"  shape: {sinogram.shape}")
-print(f"  total trues: {sinogram.total_trues}")
-print(f"  total scatter: {sinogram.total_scatter}")
+print(f"  shape:           {sinogram.shape}")
+print(f"  total trues:     {sinogram.total_trues}")
+print(f"  total scatter:   {sinogram.total_scatter}")
 print(f"  scatter fraction: {sinogram.scatter_fraction:.1%}")
 print(f"\nWall time: {result.wall_time_s:.2f} s")
+print(f"Saved to ./runs/0001/")
 
 # ============================================================================
-# Save the full run for later use
+# Bruker example — same pipeline, different scanner+binning
 # ============================================================================
-run.sinogram = sinogram
-run.save(WORK_DIR + "/saved")
-print(f"\nSaved run to {WORK_DIR}/saved/")
+print("\n" + "="*70)
+print("Same pipeline with Bruker scanner — just change scanner + binning:")
+print("="*70)
 
-# Arrays for ML training
-print(f"\nReady for training:")
-print(f"  trues:   {sinogram.trues.shape} {sinogram.trues.dtype}")
-print(f"  scatter: {sinogram.scatter.shape} {sinogram.scatter.dtype}")
+bruker_scanner = Scanner.from_preset("bruker_albira")
+bruker_binning = SinogramBinning.default_for(bruker_scanner)
+print(f"Bruker scanner: {bruker_scanner}")
+print(f"Bruker binning: {bruker_binning}")
+# (Not actually running this — would need a Bruker-sized phantom.
+#  The point is the API is identical regardless of scanner.)

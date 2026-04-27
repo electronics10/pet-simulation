@@ -1,21 +1,14 @@
 """
 MCGPU-PET backend runtime: invoke the executable and parse outputs.
 
-This module is the execution half of the MCGPU-PET backend. The input
-half (write_vox, write_in) lives in mcgpu.py. Together they provide a
-complete path: Run → input files → subprocess → output files → Sinogram.
-
 Typical usage:
 
-    backend = MCGPUBackend(executable="./MCGPU-PET.x", materials_dir=...)
-    sinogram, result = backend.run_full(run, workdir="./runs/test_01")
+    backend = MCGPUBackend(executable="./bin/MCGPU-PET.x",
+                           materials_dir="./materials")
+    sinogram, result = backend.run_full(run, run_dir="./runs/0001")
 
-The backend handles four things:
-
-  1. Write .vox and .in into the workdir.
-  2. Link/copy the materials/ directory the .in file references.
-  3. Invoke MCGPU-PET.x and capture stdout/stderr + timing.
-  4. Parse the binary output files into a Sinogram.
+The Run must carry both a Scanner (hardware) and a SinogramBinning
+(layout choice). Use SinogramBinning.default_for(scanner) if unsure.
 """
 
 from __future__ import annotations
@@ -24,7 +17,7 @@ import gzip
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -36,14 +29,9 @@ from ..sinogram import Sinogram
 from .mcgpu import MCGPUConfig, write_in, write_vox
 
 
-# =====================================================================
-# Run result
-# =====================================================================
-
-
 @dataclass
 class MCGPURunResult:
-    """Everything an MCGPU-PET invocation produced, beyond the sinogram."""
+    """Everything an MCGPU-PET invocation produced."""
 
     workdir: Path
     returncode: int
@@ -53,21 +41,12 @@ class MCGPURunResult:
     output_files: dict[str, Path] = field(default_factory=dict)
 
 
-# =====================================================================
-# Backend
-# =====================================================================
-
-
 class MCGPUBackend:
-    """Driver for the MCGPU-PET command-line simulator.
-
-    Stateless except for the path to the executable and the materials
-    directory; safe to reuse one instance across many runs.
-    """
+    """Driver for the MCGPU-PET command-line simulator."""
 
     def __init__(
         self,
-        executable: str | Path = "./MCGPU-PET.x",
+        executable: str | Path = "./bin/MCGPU-PET.x",
         materials_dir: Optional[str | Path] = None,
         materials_registry: Optional[MaterialRegistry] = None,
     ) -> None:
@@ -96,14 +75,7 @@ class MCGPUBackend:
         config: Optional[MCGPUConfig] = None,
         petsim_tag: str = "petsim",
     ) -> Path:
-        """Write .vox, .in, and link materials/ into workdir.
-
-        Cleans stale MCGPU-PET output files from previous runs in the
-        same workdir before writing — otherwise old sinograms can be
-        misread as the current run's output.
-
-        Returns the absolute workdir path.
-        """
+        """Write .vox, .in, and link materials/ into workdir."""
         workdir = Path(workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
 
@@ -113,7 +85,7 @@ class MCGPUBackend:
                 "`materials_dir` or `materials_registry` to the constructor."
             )
 
-        # Clean stale MCGPU-PET outputs from previous runs in this workdir.
+        # Clean stale outputs
         for pattern in ["*.raw", "*.raw.gz", "*.psf", "*.psf.gz",
                         "*.dat", "image_*", "sinogram_*",
                         "MCGPU-PET.in", "phantom.vox",
@@ -139,7 +111,6 @@ class MCGPUBackend:
         return workdir
 
     def _link_materials(self, workdir: Path) -> None:
-        """Make the materials/ directory available inside workdir."""
         target = workdir / "materials"
         if target.exists() or target.is_symlink():
             return
@@ -157,7 +128,6 @@ class MCGPUBackend:
         workdir: str | Path,
         timeout_s: Optional[float] = None,
     ) -> MCGPURunResult:
-        """Run MCGPU-PET.x in workdir and capture stdout/stderr."""
         workdir = Path(workdir).resolve()
         stdout_path = workdir / "MCGPU-PET.out"
         stderr_path = workdir / "MCGPU-PET.err"
@@ -197,24 +167,21 @@ class MCGPUBackend:
         self,
         run: Run,
         invoke_result: MCGPURunResult,
-        config: Optional[MCGPUConfig] = None,
     ) -> Sinogram:
-        """Parse MCGPU-PET's sinogram output files into a Sinogram object.
+        """Parse MCGPU-PET's sinogram output into a Sinogram object.
 
-        MCGPU-PET writes binary int32 arrays for trues and scatter.
-        Auto-detects the z-dimension from file size since span compression
-        produces an output size that depends on n_rings, span, and MRD.
-
-        n_angular_bins and n_radial_bins come from the MCGPUConfig (since
-        they're chosen at simulation time, not properties of the scanner).
-        Pass the same config you used in stage_inputs.
+        Reads n_angular_bins and n_radial_bins from run.binning.
+        Auto-detects n_z from file size.
         """
-        if config is None:
-            config = MCGPUConfig()
+        if run.binning is None:
+            raise ValueError(
+                "Run.binning is None — cannot parse sinogram without "
+                "knowing the bin counts."
+            )
 
         workdir = invoke_result.workdir
-        n_angular = config.n_angular_bins
-        n_radial = config.n_radial_bins
+        n_angular = run.binning.n_angular_bins
+        n_radial = run.binning.n_radial_bins
 
         trues = self._read_sinogram_file(
             candidate_names=[
@@ -245,8 +212,6 @@ class MCGPUBackend:
                 "wall_time_s": invoke_result.wall_time_s,
                 "returncode": invoke_result.returncode,
                 "scanner": run.scanner.name,
-                "span": config.span,
-                "max_ring_difference": config.max_ring_difference,
             },
         )
 
@@ -258,9 +223,6 @@ class MCGPUBackend:
         n_radial: int,
         optional: bool = False,
     ) -> Optional[np.ndarray]:
-        """Read a sinogram binary file, auto-detecting .gz compression
-        and the z-dimension from file size.
-        """
         path = None
         for name in candidate_names:
             candidate = workdir / name
@@ -287,39 +249,65 @@ class MCGPUBackend:
             raise ValueError(
                 f"Sinogram file {path.name} has {arr.size} int32 elements, "
                 f"which is not divisible by n_angular*n_radial "
-                f"({n_angular}*{n_radial}={n_angular*n_radial}). "
-                f"Either the file is corrupt or the binning parameters "
-                f"in MCGPUConfig don't match what the simulator used."
+                f"({n_angular}*{n_radial}={n_angular*n_radial})."
             )
 
         n_z = arr.size // (n_angular * n_radial)
         return arr.reshape((n_z, n_angular, n_radial)).copy()
 
     # ------------------------------------------------------------------
-    # Convenience: full pipeline in one call
+    # Full pipeline
     # ------------------------------------------------------------------
 
     def run_full(
         self,
         run: Run,
-        workdir: str | Path,
+        run_dir: str | Path,
         config: Optional[MCGPUConfig] = None,
+        workdir: Optional[str | Path] = None,
         timeout_s: Optional[float] = None,
         petsim_tag: str = "petsim",
+        keep_workdir: bool = False,
     ) -> tuple[Sinogram, MCGPURunResult]:
-        """Stage inputs, invoke the binary, parse outputs.
+        """Stage, run, parse, save — the complete pipeline.
 
-        Pass the same `config` here as you would to stage_inputs/parse_sinogram
-        — it's used both to write the .in file AND to interpret the output
-        binary's shape.
+        Saves the 5 essential files to run_dir on success and cleans
+        up the temp workdir. On crash, the workdir is preserved for
+        debugging.
         """
-        workdir = self.stage_inputs(run, workdir, config=config,
-                                    petsim_tag=petsim_tag)
+        if config is None:
+            config = MCGPUConfig()
+
+        run_dir = Path(run_dir).resolve()
+        if workdir is None:
+            workdir = run_dir / "tmp"
+        workdir = Path(workdir).resolve()
+
+        # Stage inputs
+        self.stage_inputs(run, workdir, config=config, petsim_tag=petsim_tag)
+
+        # Run
         invoke_result = self.invoke(workdir, timeout_s=timeout_s)
+
+        # On crash, leave workdir for debugging
         if invoke_result.returncode != 0:
             raise RuntimeError(
                 f"MCGPU-PET exited with code {invoke_result.returncode}; "
-                f"see {invoke_result.stdout_path} and {invoke_result.stderr_path}"
+                f"inspect {workdir} for input files and logs"
             )
-        sinogram = self.parse_sinogram(run, invoke_result, config=config)
+
+        # Parse
+        sinogram = self.parse_sinogram(run, invoke_result)
+
+        # Attach to run, record metadata, save
+        run.sinogram = sinogram
+        run.metadata["backend"] = "mcgpu"
+        run.metadata["mcgpu_config"] = asdict(config)
+        run.metadata["wall_time_s"] = invoke_result.wall_time_s
+        run.save(run_dir)
+
+        # Clean up on success
+        if not keep_workdir and workdir.exists():
+            shutil.rmtree(workdir)
+
         return sinogram, invoke_result
