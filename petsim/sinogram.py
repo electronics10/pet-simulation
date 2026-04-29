@@ -1,8 +1,19 @@
 """
 Sinogram: a minimal container for PET coincidence histograms.
 
-A Sinogram is just a pair of 3D arrays (trues and scatter) with shape
-(n_z, n_angular, n_radial), plus metadata. It's a data container, nothing more.
+A Sinogram wraps a pair of arrays (trues and scatter) of arbitrary rank
+plus metadata. It's a data container, nothing more.
+
+Backends choose the layout. Two formats are currently in use:
+
+    3D legacy:        (n_z_planes, n_angular, n_radial)
+                      Used by MCGPU's native Michelogram output.
+    4D ring-pair:     (n_rings, n_rings, n_angular, n_radial)
+                      Used by GATE backend's LOR-based histogrammer.
+
+The `axes` field optionally records what each axis means
+(e.g. ("ring1", "ring2", "angular", "radial")) so downstream code can
+introspect the layout. Empty for legacy 3D sinograms.
 
 For ML training, you mostly just need the arrays. The save/load methods
 keep them organized in `.npz` files.
@@ -24,11 +35,14 @@ class Sinogram:
     Attributes
     ----------
     trues : np.ndarray
-        Counts of true coincidences, shape (n_z, n_angular, n_radial).
+        Counts of true coincidences. Arbitrary rank.
     scatter : np.ndarray or None
-        Counts of scattered coincidences, same shape. Can be None.
-    shape : tuple[int, int, int]
-        The sinogram shape (n_z, n_angular, n_radial) for reference.
+        Counts of scattered coincidences, same shape as `trues`.
+    shape : tuple[int, ...]
+        Sinogram shape, must match `trues.shape`.
+    axes : tuple[str, ...]
+        Optional names for each axis (e.g. ("ring1", "ring2", "angular",
+        "radial")). Empty for legacy 3D sinograms.
     metadata : dict
         Free-form dict populated by backends. Common keys:
           - backend: "mcgpu" | "gate"
@@ -37,15 +51,18 @@ class Sinogram:
     """
 
     trues: np.ndarray
-    shape: tuple[int, int, int]
+    shape: tuple[int, ...]
     scatter: np.ndarray | None = None
+    axes: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.trues = np.asarray(self.trues, dtype=np.float32)
         if self.scatter is not None:
             self.scatter = np.asarray(self.scatter, dtype=np.float32)
-        
+
+        self.shape = tuple(int(s) for s in self.shape)
+
         if self.trues.shape != self.shape:
             raise ValueError(
                 f"trues shape {self.trues.shape} doesn't match declared shape {self.shape}"
@@ -54,6 +71,14 @@ class Sinogram:
             raise ValueError(
                 f"scatter shape {self.scatter.shape} doesn't match declared shape {self.shape}"
             )
+
+        if self.axes:
+            self.axes = tuple(str(a) for a in self.axes)
+            if len(self.axes) != len(self.shape):
+                raise ValueError(
+                    f"axes length {len(self.axes)} doesn't match shape rank "
+                    f"{len(self.shape)}"
+                )
 
     @property
     def total_trues(self) -> int:
@@ -76,9 +101,14 @@ class Sinogram:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        arrays = {"trues": self.trues, "shape": np.array(self.shape, dtype=np.int32)}
+        arrays: dict[str, np.ndarray] = {
+            "trues": self.trues,
+            "shape": np.array(self.shape, dtype=np.int32),
+        }
         if self.scatter is not None:
             arrays["scatter"] = self.scatter
+        if self.axes:
+            arrays["axes"] = np.array(self.axes)
         arrays["metadata"] = np.array(self.metadata, dtype=object)
 
         np.savez_compressed(path, **arrays)
@@ -90,8 +120,9 @@ class Sinogram:
         with np.load(path, allow_pickle=True) as data:
             return cls(
                 trues=data["trues"],
-                shape=tuple(data["shape"]),
+                shape=tuple(int(x) for x in data["shape"]),
                 scatter=data["scatter"] if "scatter" in data.files else None,
+                axes=tuple(str(a) for a in data["axes"]) if "axes" in data.files else (),
                 metadata=data["metadata"].item() if "metadata" in data.files else {},
             )
 
@@ -102,4 +133,5 @@ class Sinogram:
             sf = self.scatter_fraction
             if sf is not None:
                 components.append(f"SF={sf:.1%}")
-        return f"Sinogram(shape={self.shape}, {', '.join(components)})"
+        axes_part = f", axes={self.axes}" if self.axes else ""
+        return f"Sinogram(shape={self.shape}{axes_part}, {', '.join(components)})"

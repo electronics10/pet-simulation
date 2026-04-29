@@ -26,7 +26,7 @@ for translating to and from their native conventions at write time.
   - Origin: voxel (0, 0, 0) — the corner of the grid, NOT the center.
   - Axes: +x, +y, +z in array index order. For a numpy array `a`,
     `a[ix, iy, iz]` is the voxel at position (ix*dx, iy*dy, iz*dz).
-  - Units: centimeters everywhere in the public API. Backends convert
+  - Units: millimeters everywhere in the public API. Backends convert
     to their native units (MCGPU-PET uses cm natively; GATE uses mm).
   - Voxel position: a voxel's spatial center is at
     `((ix+0.5)*dx, (iy+0.5)*dy, (iz+0.5)*dz)`.

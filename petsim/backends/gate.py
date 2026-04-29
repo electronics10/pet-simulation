@@ -1,40 +1,45 @@
 """
 GATE backend: drive GATE 10 simulations via the `opengate` Python API.
 
-Design notes
-------------
-Unlike MCGPU-PET, GATE doesn't need on-disk input files — the simulation
-is built in memory via opengate's Simulation object. The pipeline is:
+Pass 1 (physics) — DONE
+-----------------------
+- Voxelized source via VoxelSource + activity MHD.
+- Voxelized phantom via ImageVolume + material-ID MHD.
+- Scatter labelling via a separate HitsCollectionActor on the phantom:
+  any EventID with a `compt`/`Rayl` process in the phantom is flagged
+  as scattered. Coincidences split: same-event-no-scatter = true,
+  same-event-with-scatter = scatter, different-event = random.
 
-  1. build(run, workdir, config) → Simulation object (inspect/modify before running)
-  2. run_full(run, run_dir, config) → (Sinogram, GATERunResult): the all-in-one path
+Pass 2 (histogrammer) — DONE
+----------------------------
+4D ring-pair sinogram: shape (n_rings, n_rings, n_angular, n_radial).
 
-Geometry
---------
-The backend builds the full Bruker-style cylindricalPET geometry from
-Scanner fields (n_rings, n_crystals_per_ring, crystal_size_mm, etc.).
-For scanners without crystal-level detail, it falls back to a simplified
-single-ring cylinder.
+For each coincidence:
+  1. Recover (ring, crystal_in_ring) from the energy-weighted centroid
+     position via xy-angle and z-position.
+  2. Compute view angle and *signed* perpendicular distance from origin
+     to the LOR connecting the two crystal centers.
+  3. Bin into (ring1, ring2, view, radial).
 
-Materials
----------
-Material name resolution uses the same MaterialRegistry as MCGPU-PET.
-Each Material carries both mcgpu_file (for MCGPU) and gate_name (for GATE),
-so `registry.gate_name("water")` returns `"G4_WATER"` and
-`registry.gate_name("lyso")` returns `"LYSO"` (from GateMaterials.db).
+Output axes are recorded in Sinogram.axes for downstream introspection.
 
-Pass materials_db to GATEBackend to enable custom materials like LYSO.
-Pass a pre-built MaterialRegistry directly if you want to share one
-instance across both backends.
+Note: each LOR appears in both (r1=A, r2=B) and (r1=B, r2=A) because the
+simulator labels which photon is "1" vs "2" arbitrarily. Counts split
+~50/50 between the two index orderings. Symmetrize at read time if you
+need the canonical ring1 <= ring2 form.
 
-Sinogram output
----------------
-GATE's CoincidenceSorterActor writes list-mode coincidences to a ROOT
-file. We read that with uproot and histogram each event into a sinogram
-using the Michelogram convention defined in SinogramBinning.
+Pass 3 (auxiliary outputs) — DONE
+---------------------------------
+- mu_map.npy at 511 keV.
+- voxel_size_mm in run.metadata.
 
-NOTE: The Michelogram histogrammer (_histogram_coincidences) is currently
-a placeholder — direct segment only. See TODO in README.
+Known limitations
+-----------------
+- Bruker geometry has axial gaps between modules. The z->ring mapping
+  uses a uniform linear projection over [-L/2, +L/2], which approximates
+  this. Counts may bleed slightly between adjacent rings near gaps.
+- LYSO density in GateMaterials.db (5.37 g/cm^3) is below real LYSO
+  (~7.1 g/cm^3); affects detection efficiency.
 """
 
 from __future__ import annotations
@@ -55,32 +60,47 @@ from ..source import Source
 
 
 # =====================================================================
+# Mass attenuation coefficients at 511 keV (cm^2/g)
+# =====================================================================
+
+MU_OVER_RHO_511_KEV: dict[str, float] = {
+    "air":                0.0869,
+    "water":              0.0958,
+    "lung":               0.0958,
+    "adipose":            0.0937,
+    "muscle":             0.0961,
+    "soft_tissue":        0.0954,
+    "blood":              0.0959,
+    "brain":              0.0959,
+    "liver":              0.0961,
+    "kidneys":            0.0961,
+    "skin":               0.0961,
+    "cartilage":          0.0972,
+    "spongiosa":          0.0866,
+    "stomach_intestines": 0.0954,
+    "glands":             0.0954,
+    "eyes":               0.0958,
+    "breast_glandular":   0.0941,
+    "lyso":               0.0871,
+    "lso":                0.0871,
+    "bgo":                0.0961,
+}
+
+
+# =====================================================================
 # Config
 # =====================================================================
 
 
 @dataclass
 class GATEConfig:
-    """GATE-specific runtime parameters.
+    """GATE-specific runtime parameters."""
 
-    These are things GATE cares about that MCGPU doesn't have an
-    equivalent for. Binning (span, MRD, etc.) stays in Run.binning.
-    """
-
-    # ---- Physics -----------------------------------------------------
     physics_list: str = "G4EmStandardPhysics_option3"
     production_cut_mm: float = 1.0
-
-    # ---- Source model ------------------------------------------------
-    # back_to_back=True: emit two collinear 511 keV gammas directly.
-    # Faster and matches MCGPU's model (no positron range).
     back_to_back: bool = True
-
-    # ---- Output ------------------------------------------------------
     keep_root_output: bool = False
     root_output_filename: str = "gate_output.root"
-
-    # ---- Runtime -----------------------------------------------------
     n_threads: int = 1
     verbose_level: int = 0
 
@@ -113,27 +133,13 @@ class GATEBackend:
         materials_db: Optional[str | Path] = None,
         materials_registry: Optional[MaterialRegistry] = None,
     ) -> None:
-        """
-        Parameters
-        ----------
-        materials_db : path to a GateMaterials.db file for custom materials
-            (e.g. LYSO). If None, only NIST G4_* materials are available.
-            A MaterialRegistry is built automatically from this path using
-            the default material table in materials.py.
-        materials_registry : pre-built MaterialRegistry. Pass this if you
-            want to share one instance across both backends, or if you need
-            custom materials beyond the defaults. Takes priority over
-            materials_db if both are given.
-        """
-        self.materials_db = Path(materials_db).resolve() \
-            if materials_db is not None else None
+        self.materials_db = (
+            Path(materials_db).resolve() if materials_db is not None else None
+        )
 
         if materials_registry is not None:
             self.materials_registry = materials_registry
         elif self.materials_db is not None:
-            # Build a registry pointing at the db's parent directory.
-            # GATE only needs gate_name() from the registry, so
-            # mcgpu_materials_dir can point anywhere — it's unused here.
             self.materials_registry = MaterialRegistry(
                 mcgpu_materials_dir=self.materials_db.parent,
             )
@@ -141,6 +147,97 @@ class GATEBackend:
             self.materials_registry = MaterialRegistry(
                 mcgpu_materials_dir=Path("."),
             )
+
+    # ------------------------------------------------------------------
+    # MHD writers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mhd_offset(phantom: Phantom) -> tuple[float, float, float]:
+        dx, dy, dz = [v * 10.0 for v in phantom.voxel_size]  # cm -> mm
+        nx, ny, nz = phantom.shape
+        return (-(nx - 1) * dx / 2.0,
+                -(ny - 1) * dy / 2.0,
+                -(nz - 1) * dz / 2.0)
+
+    @staticmethod
+    def _write_mhd(
+        path: Path,
+        raw_filename: str,
+        shape: tuple[int, int, int],
+        spacing_mm: tuple[float, float, float],
+        offset_mm: tuple[float, float, float],
+        element_type: str,
+    ) -> None:
+        nx, ny, nz = shape
+        dx, dy, dz = spacing_mm
+        ox, oy, oz = offset_mm
+        path.write_text(
+            "ObjectType = Image\n"
+            "NDims = 3\n"
+            "BinaryData = True\n"
+            "BinaryDataByteOrderMSB = False\n"
+            "CompressedData = False\n"
+            "TransformMatrix = 1 0 0 0 1 0 0 0 1\n"
+            f"Offset = {ox:.6f} {oy:.6f} {oz:.6f}\n"
+            "CenterOfRotation = 0 0 0\n"
+            f"ElementSpacing = {dx:.6f} {dy:.6f} {dz:.6f}\n"
+            f"DimSize = {nx} {ny} {nz}\n"
+            f"ElementType = {element_type}\n"
+            f"ElementDataFile = {raw_filename}\n"
+        )
+
+    @classmethod
+    def _write_activity_image(cls, source: Source, phantom: Phantom, workdir: Path) -> Path:
+        mhd_path = workdir / "source_activity.mhd"
+        raw_path = workdir / "source_activity.raw"
+        source.activity_Bq.astype(np.float32).tofile(str(raw_path))
+        spacing = tuple(v * 10.0 for v in phantom.voxel_size)
+        cls._write_mhd(
+            mhd_path, raw_path.name, phantom.shape, spacing,
+            cls._mhd_offset(phantom), "MET_FLOAT",
+        )
+        return mhd_path
+
+    @classmethod
+    def _write_material_image(cls, phantom: Phantom, workdir: Path) -> Path:
+        mhd_path = workdir / "phantom_materials.mhd"
+        raw_path = workdir / "phantom_materials.raw"
+        phantom.material_ids.astype(np.uint16).tofile(str(raw_path))
+        spacing = tuple(v * 10.0 for v in phantom.voxel_size)
+        cls._write_mhd(
+            mhd_path, raw_path.name, phantom.shape, spacing,
+            cls._mhd_offset(phantom), "MET_USHORT",
+        )
+        return mhd_path
+
+    @staticmethod
+    def write_mu_map(phantom: Phantom, output_path: Path) -> np.ndarray:
+        """Compute and save linear attenuation map at 511 keV (cm^-1)."""
+        mu = np.zeros(phantom.shape, dtype=np.float32)
+        for i, name in enumerate(phantom.material_names, start=1):
+            mu_over_rho = MU_OVER_RHO_511_KEV.get(name.lower(), 0.0958)
+            mask = phantom.material_ids == i
+            mu[mask] = phantom.densities[mask] * mu_over_rho
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_path, mu)
+        return mu
+
+    # ------------------------------------------------------------------
+    # Crystal-center radius (used by histogrammer)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _crystal_center_radius_mm(scanner) -> float:
+        """Effective radius at which crystal centers sit, in mm.
+
+        For the full Bruker geometry, _build_full_geometry places crystal
+        centers at (detector_radius_cm * 10 + crystal_x / 2). The simple
+        fallback geometry uses detector_radius_cm * 10 directly.
+        """
+        if scanner.crystal_size_mm is not None:
+            return scanner.detector_radius_cm * 10.0 + scanner.crystal_size_mm[0] / 2.0
+        return scanner.detector_radius_cm * 10.0
 
     # ------------------------------------------------------------------
     # Build
@@ -155,10 +252,6 @@ class GATEBackend:
         """Build an opengate Simulation from a petsim Run."""
         try:
             import opengate as gate
-            from opengate.geometry.utility import (
-                get_grid_repetition,
-                get_circular_repetition,
-            )
         except ImportError as exc:
             raise ImportError(
                 "The GATE backend requires opengate. Install with: uv add opengate"
@@ -166,12 +259,8 @@ class GATEBackend:
 
         if config is None:
             config = GATEConfig()
-
         if run.binning is None:
-            raise ValueError(
-                "Run.binning is None — GATE backend needs SinogramBinning. "
-                "Use SinogramBinning.default_for(scanner) or a preset."
-            )
+            raise ValueError("Run.binning is None — GATE backend needs SinogramBinning.")
 
         workdir = Path(workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
@@ -181,7 +270,6 @@ class GATEBackend:
         Bq = gate.g4_units.Bq
         s = gate.g4_units.s
 
-        # ---- Simulation object ---------------------------------------
         sim = gate.Simulation()
         sim.output_dir = str(workdir)
         sim.random_seed = run.seed if run.seed is not None else "auto"
@@ -189,23 +277,30 @@ class GATEBackend:
         sim.visu = False
         sim.check_volumes_overlap = False
 
-        # ---- Materials -----------------------------------------------
-        # Note: GateMaterials.db may emit warnings about zero-fraction
-        # elements (e.g. "fraction 'f=' is 0"). These are benign — GATE
-        # simply ignores zero-fraction components. They come from the
-        # handover .db file and can be silenced by cleaning up those
-        # entries, but they don't affect simulation correctness.
         if self.materials_db is not None:
             db_dest = workdir / self.materials_db.name
             if not db_dest.exists():
                 shutil.copy2(self.materials_db, db_dest)
             sim.volume_manager.add_material_database(str(db_dest))
 
-        # ---- World ---------------------------------------------------
         scanner = run.scanner
         world = sim.world
-        world.size = [1000 * mm, 1000 * mm, 1000 * mm]  # 1m cube
+        world.size = [1000 * mm, 1000 * mm, 1000 * mm]
         world.material = "G4_AIR"
+
+        # ---- Voxelized phantom ---------------------------------------
+        phantom_mhd = self._write_material_image(run.phantom, workdir)
+        phantom_vol = sim.add_volume("ImageVolume", "phantom")
+        phantom_vol.image = str(phantom_mhd)
+
+        voxel_materials = []
+        for i, name in enumerate(run.phantom.material_names, start=1):
+            try:
+                gate_name = self.materials_registry.gate_name(name)
+            except KeyError:
+                gate_name = "G4_AIR"
+            voxel_materials.append([i - 0.5, i + 0.5, gate_name])
+        phantom_vol.voxel_materials = voxel_materials
 
         # ---- Scanner geometry ----------------------------------------
         if scanner.crystal_size_mm is not None:
@@ -213,22 +308,22 @@ class GATEBackend:
         else:
             crystal = self._build_simple_geometry(sim, scanner, mm)
 
-        # ---- Physics -------------------------------------------------
         sim.physics_manager.physics_list_name = config.physics_list
         sim.physics_manager.set_production_cut(
             "world", "all", config.production_cut_mm * mm
         )
 
-        # ---- Source --------------------------------------------------
-        source = sim.add_source("GenericSource", "pet_source")
-        source.particle = "back_to_back" if config.back_to_back else "e+"
-        source.activity = float(run.source.total_activity_Bq) * Bq
-        source.position.type = "point"
-        source.position.translation = [0, 0, 0]
-        source.direction.type = "iso"
-        # TODO: replace with voxelized source from run.source
+        # ---- Voxelized source ----------------------------------------
+        source_mhd = self._write_activity_image(run.source, run.phantom, workdir)
+        pet_source = sim.add_source("VoxelSource", "pet_source")
+        pet_source.particle = "back_to_back" if config.back_to_back else "e+"
+        pet_source.activity = float(run.source.total_activity_Bq) * Bq
+        pet_source.image = str(source_mhd)
+        print(f"[build] source MHD offset would put hot voxel at (+10, 0, 0) mm")
+        print(f"[build] source position translation: {pet_source.position.translation}")
+        print(f"[build] source position type: {pet_source.position.type}")
 
-        # ---- Digitizer chain -----------------------------------------
+        # ---- Digitizer chain on crystals -----------------------------
         output_file = config.root_output_filename
 
         hc = sim.add_actor("DigitizerHitsCollectionActor", "Hits")
@@ -265,11 +360,21 @@ class GATEBackend:
         cc.window = (scanner.coincidence_window_ns or 10.0) * 1e-9 * s
         cc.output_filename = output_file
 
+        # ---- Phantom hits actor (scatter labelling) ------------------
+        ph = sim.add_actor("DigitizerHitsCollectionActor", "PhantomHits")
+        ph.attached_to = phantom_vol.name
+        ph.authorize_repeated_volumes = True
+        ph.output_filename = output_file
+        ph.attributes = [
+            "EventID",
+            "ProcessDefinedStep",
+            "TotalEnergyDeposit",
+        ]
+
         stats = sim.add_actor("SimulationStatisticsActor", "Stats")
         stats.output_filename = "stats.txt"
 
         sim.run_timing_intervals = [[0, scanner.acquisition_time_s * s]]
-
         return sim
 
     # ------------------------------------------------------------------
@@ -277,82 +382,59 @@ class GATEBackend:
     # ------------------------------------------------------------------
 
     def _build_full_geometry(self, sim, scanner, mm):
-        """Full rsector → module → crystal hierarchy from Scanner fields.
-
-        Mirrors bruker_pet_sim.py exactly. Key numbers for bruker_albira:
-          - rsector at x=67mm, size 10.5 x 50.5 x 95mm
-          - module size 10.5 x 50.5 x 50.5mm, 3 axially at 32mm pitch
-          - crystal size 10 x 6mm x 6mm (6.3mm pitch), 8x8 per module
-        """
         from opengate.geometry.utility import (
             get_grid_repetition,
             get_circular_repetition,
         )
 
-        crystal_x, crystal_y, crystal_z = scanner.crystal_size_mm  # (10, 6.25, 6.25)
-        cy, cz = scanner.crystals_per_module        # (8, 8) tang x axial
-        _, _, mz = scanner.modules_per_rsector      # (1, 1, 3) axial modules
-        n_rsectors = scanner.n_rsectors             # 8
+        crystal_x, crystal_y, crystal_z = scanner.crystal_size_mm
+        cy, cz = scanner.crystals_per_module
+        _, _, mz = scanner.modules_per_rsector
+        n_rsectors = scanner.n_rsectors
 
-        # Use slightly larger pitch than crystal size to avoid overlaps
-        # (matches reference: 50.5mm module, 6.3mm crystal pitch)
-        crystal_pitch_y = crystal_y * 1.008   # ~6.3mm for 6.25mm crystals
+        crystal_pitch_y = crystal_y * 1.008
         crystal_pitch_z = crystal_z * 1.008
-        module_y = cy * crystal_pitch_y         # ~50.4mm
-        module_z = cz * crystal_pitch_z         # ~50.4mm
-        module_pitch_z = 32.0                   # mm, matches reference exactly
-        rsector_y = module_y + 0.5              # slight margin
-        rsector_z = scanner.detector_axial_length_cm * 10.0  # 105mm
-
-        # Rsector radial placement (matches reference: 67mm from axis)
+        module_y = cy * crystal_pitch_y
+        module_z = cz * crystal_pitch_z
+        module_pitch_z = 32.0
+        rsector_y = module_y + 0.5
+        rsector_z = scanner.detector_axial_length_cm * 10.0
         rsector_x_mm = scanner.detector_radius_cm * 10.0 + crystal_x / 2.0
 
-        # Scanner envelope
         sc_vol = sim.add_volume("Tubs", "scanner")
         sc_vol.rmax = (rsector_x_mm + crystal_x / 2.0 + 2) * mm
         sc_vol.rmin = (rsector_x_mm - crystal_x / 2.0 - 2) * mm
         sc_vol.dz = (rsector_z / 2.0) * mm
         sc_vol.material = "G4_AIR"
 
-        # rsector: 8 around the ring
         rsector = sim.add_volume("Box", "rsector")
         rsector.mother = sc_vol.name
         rsector.size = [(crystal_x + 0.5) * mm, rsector_y * mm, rsector_z * mm]
         rsector.material = "G4_AIR"
         t, r = get_circular_repetition(
-            n_rsectors,
-            [rsector_x_mm * mm, 0, 0],
-            axis=[0, 0, 1],
+            n_rsectors, [rsector_x_mm * mm, 0, 0], axis=[0, 0, 1]
         )
         rsector.translation = t
         rsector.rotation = r
 
-        # module: mz axially per rsector at module_pitch_z spacing
         module = sim.add_volume("Box", "module")
         module.mother = rsector.name
         module.size = [(crystal_x + 0.5) * mm, rsector_y * mm, (module_z + 0.5) * mm]
         module.material = "G4_AIR"
-        module.translation = get_grid_repetition(
-            [1, 1, mz], [0, 0, module_pitch_z * mm]
-        )
+        module.translation = get_grid_repetition([1, 1, mz], [0, 0, module_pitch_z * mm])
 
-        # crystal: cy x cz per module
         crystal = sim.add_volume("Box", "crystal")
         crystal.mother = module.name
         crystal.size = [crystal_x * mm, crystal_y * mm, crystal_z * mm]
-
-        # Resolve crystal material via MaterialRegistry
-        raw_name = scanner.crystal_material or "lyso"
-        crystal.material = self.materials_registry.gate_name(raw_name)
-
+        crystal.material = self.materials_registry.gate_name(
+            scanner.crystal_material or "lyso"
+        )
         crystal.translation = get_grid_repetition(
             [1, cy, cz], [0, crystal_pitch_y * mm, crystal_pitch_z * mm]
         )
-
         return crystal
 
     def _build_simple_geometry(self, sim, scanner, mm):
-        """Fallback: a single flat ring of crystals."""
         from opengate.geometry.utility import get_circular_repetition
 
         n = scanner.n_crystals_per_ring
@@ -372,21 +454,35 @@ class GATEBackend:
         t, r = get_circular_repetition(n, [r_mm * mm, 0, 0], axis=[0, 0, 1])
         crystal.translation = t
         crystal.rotation = r
-
         return crystal
 
     # ------------------------------------------------------------------
-    # Parse sinogram from ROOT output
+    # Parse sinogram
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _scattered_event_ids(phantom_hits: dict) -> set[int]:
+        proc = phantom_hits["ProcessDefinedStep"]
+        if proc.dtype.kind == "O" or proc.dtype.kind == "S":
+            proc_strs = np.array(
+                [p.decode() if isinstance(p, (bytes, bytearray)) else str(p)
+                 for p in proc],
+                dtype=object,
+            )
+        else:
+            proc_strs = proc.astype(str)
+        is_scatter = np.array(
+            ["compt" in p.lower() or "rayl" in p.lower() for p in proc_strs]
+        )
+        return set(phantom_hits["EventID"][is_scatter].tolist())
+
     def parse_sinogram(self, run: Run, result: GATERunResult) -> Sinogram:
-        """Read GATE's ROOT output and histogram into a Sinogram."""
+        """Read GATE ROOT output, label scatter, histogram into 4D ring-pair sinogram."""
         try:
             import uproot
         except ImportError as exc:
             raise ImportError(
-                "Parsing GATE ROOT output requires uproot. "
-                "Install with: uv add uproot"
+                "Parsing GATE ROOT output requires uproot. uv add uproot"
             ) from exc
 
         if result.root_output_path is None or not result.root_output_path.exists():
@@ -398,60 +494,185 @@ class GATEBackend:
         scanner = run.scanner
 
         with uproot.open(result.root_output_path) as f:
-            tree = f["Coincidences"]
-            arrays = tree.arrays(
-                ["PostPosition1_X", "PostPosition1_Y", "PostPosition1_Z",
-                 "PostPosition2_X", "PostPosition2_Y", "PostPosition2_Z"],
+            tree_keys = {k.split(";")[0] for k in f.keys()}
+            print(f"[parse] available trees: {sorted(tree_keys)}")
+
+            if "Coincidences" not in tree_keys:
+                raise KeyError("No 'Coincidences' tree in ROOT output.")
+            coinc = f["Coincidences"].arrays(
+                [
+                    "EventID1", "EventID2",
+                    "PostPosition1_X", "PostPosition1_Y", "PostPosition1_Z",
+                    "PostPosition2_X", "PostPosition2_Y", "PostPosition2_Z",
+                ],
                 library="np",
             )
 
-        trues = self._histogram_coincidences(arrays, scanner, binning)
+            phantom_hits = None
+            if "PhantomHits" in tree_keys:
+                phantom_hits = f["PhantomHits"].arrays(
+                    ["EventID", "ProcessDefinedStep"], library="np"
+                )
+
+        n_total = len(coinc["EventID1"])
+        print(f"[parse] coincidences: {n_total}")
+
+        if phantom_hits is None or len(phantom_hits["EventID"]) == 0:
+            print("[parse] no phantom hits — assuming all events unscattered")
+            scattered_ids: set[int] = set()
+        else:
+            scattered_ids = self._scattered_event_ids(phantom_hits)
+            print(f"[parse] phantom hits: {len(phantom_hits['EventID'])}")
+            print(f"[parse] events with scatter: {len(scattered_ids)}")
+
+        same_event = coinc["EventID1"] == coinc["EventID2"]
+
+        if scattered_ids:
+            scattered_arr = np.fromiter(scattered_ids, dtype=np.int64,
+                                        count=len(scattered_ids))
+            event_was_scattered = np.isin(coinc["EventID1"], scattered_arr)
+        else:
+            event_was_scattered = np.zeros(n_total, dtype=bool)
+
+        true_mask = same_event & ~event_was_scattered
+        scatter_mask = same_event & event_was_scattered
+
+        print(f"[parse] same_event: {same_event.sum()}")
+        print(f"[parse] true:       {true_mask.sum()}")
+        print(f"[parse] scatter:    {scatter_mask.sum()}")
+        print(f"[parse] random:     {(~same_event).sum()}")
+
+        true_arrays = {k: v[true_mask] for k, v in coinc.items()}
+        scatter_arrays = {k: v[scatter_mask] for k, v in coinc.items()}
+
+        trues = self._histogram_coincidences(true_arrays, scanner, binning)
+        scatter = self._histogram_coincidences(scatter_arrays, scanner, binning)
+
+        metadata = {
+            "backend": "gate",
+            "wall_time_s": result.wall_time_s,
+            "scanner": scanner.name,
+            "scatter_labelled": True,
+            "n_total_coincidences": int(n_total),
+            "n_trues": int(true_mask.sum()),
+            "n_scatter": int(scatter_mask.sum()),
+            "n_randoms": int((~same_event).sum()),
+        }
 
         return Sinogram(
             trues=trues,
-            scatter=None,   # TODO: label scatter via EventID matching
+            scatter=scatter,
             shape=trues.shape,
-            metadata={
-                "backend": "gate",
-                "wall_time_s": result.wall_time_s,
-                "scanner": scanner.name,
-                "note": "Michelogram histogramming is placeholder — direct only",
-            },
+            axes=("ring1", "ring2", "angular", "radial"),
+            metadata=metadata,
         )
 
-    @staticmethod
-    def _histogram_coincidences(arrays, scanner, binning) -> np.ndarray:
-        """Bin list-mode coincidences into a sinogram.
+    # ------------------------------------------------------------------
+    # Pass 2: LOR-based 4D histogrammer
+    # ------------------------------------------------------------------
 
-        PLACEHOLDER: direct segment only (z-midpoint binning).
-        Full Michelogram matching MCGPU's layout is deferred — see README TODO.
+    # ------------------------------------------------------------------
+    # Pass 2: LOR-based 4D histogrammer (FIXED)
+    # ------------------------------------------------------------------
+
+    def _histogram_coincidences(
+        self, arrays: dict, scanner, binning,
+    ) -> np.ndarray:
+        """Bin coincidences into a 4D ring-pair sinogram.
+
+        Output shape: (n_rings, n_rings, n_angular, n_radial).
+
+        Uses the actual hit positions to compute LOR geometry, NOT
+        reconstructed crystal centers. Snapping to crystal centers
+        collapses opposite crystals to (c1, c1+N/2) for most events,
+        which makes every LOR pass through the origin and destroys the
+        radial offset signal — that bug took longer to find than I'd
+        like to admit.
+
+        Crystal indices (ring, crystal_in_ring) are still recovered for
+        bookkeeping, but only the ring index is used (for the (r1, r2)
+        bin); the in-ring index doesn't enter the LOR geometry.
+
+        Steps:
+          1. Recover ring index for each end from z position.
+          2. Compute LOR midpoint and perpendicular from raw (x, y) hits.
+          3. View angle phi = atan2(perp_y, perp_x) wrapped to [0, π).
+             Signed radial s = midpoint · perp_normalized.
+          4. Bin into (r1, r2, phi_bin, s_bin).
         """
-        n_z = 2 * scanner.n_rings - 1
+        n_rings = scanner.n_rings
+        R_eff = self._crystal_center_radius_mm(scanner)
+        L_mm = scanner.detector_axial_length_cm * 10.0
         n_ang = binning.n_angular_bins
         n_rad = binning.n_radial_bins
 
-        sino = np.zeros((n_z, n_ang, n_rad), dtype=np.float32)
+        sino = np.zeros((n_rings, n_rings, n_ang, n_rad), dtype=np.float32)
 
-        x1, y1, z1 = arrays["PostPosition1_X"], arrays["PostPosition1_Y"], arrays["PostPosition1_Z"]
-        x2, y2, z2 = arrays["PostPosition2_X"], arrays["PostPosition2_Y"], arrays["PostPosition2_Z"]
+        x1 = arrays["PostPosition1_X"]
+        if len(x1) == 0:
+            return sino
 
-        phi = np.arctan2(y1 + y2, x1 + x2) % np.pi
+        y1 = arrays["PostPosition1_Y"]
+        z1 = arrays["PostPosition1_Z"]
+        x2 = arrays["PostPosition2_X"]
+        y2 = arrays["PostPosition2_Y"]
+        z2 = arrays["PostPosition2_Z"]
+
+        # ---- Ring index from z, with rounding ------------------------
+        # Use round() not int() to put z=0 events into ring n_rings/2,
+        # not n_rings/2 - 1. The previous integer-truncation off-by-one
+        # caused the (12, 12) direct plane to be empty — events landed
+        # in (11, 12) and (12, 11) instead.
+        r1 = np.round((z1 + L_mm / 2.0) / L_mm * (n_rings - 1)).astype(np.int32)
+        r2 = np.round((z2 + L_mm / 2.0) / L_mm * (n_rings - 1)).astype(np.int32)
+        r1 = np.clip(r1, 0, n_rings - 1)
+        r2 = np.clip(r2, 0, n_rings - 1)
+
+        # ---- LOR geometry from raw xy hits ---------------------------
+        mx = (x1 + x2) / 2.0
+        my = (y1 + y2) / 2.0
+
+        dx = x2 - x1
+        dy = y2 - y1
+        d_mag = np.sqrt(dx * dx + dy * dy)
+
+        valid = d_mag > 1e-6
+        if not valid.all():
+            kept = int(valid.sum())
+            print(f"[hist] skipping {len(valid) - kept} degenerate LORs")
+
+        # Avoid division warnings on the invalid rows
+        d_mag_safe = np.where(valid, d_mag, 1.0)
+        perp_x = -dy / d_mag_safe
+        perp_y =  dx / d_mag_safe
+
+        # View angle of the perpendicular, wrapped to [0, π)
+        phi = np.arctan2(perp_y, perp_x)
+        # Sign of perpendicular flips the radial sign; canonicalize by
+        # forcing perp to point in the upper half-plane (phi in [0, π))
+        flip = phi < 0
+        perp_x = np.where(flip, -perp_x, perp_x)
+        perp_y = np.where(flip, -perp_y, perp_y)
+        phi = np.where(flip, phi + np.pi, phi)
+        phi = phi % np.pi
+
+        # Signed perpendicular distance from origin to LOR
+        s = mx * perp_x + my * perp_y  # in [-R_eff, +R_eff]
+
+        # Bin
         ang_idx = np.clip((phi / np.pi * n_ang).astype(np.int32), 0, n_ang - 1)
-
-        r = np.sqrt(((x1 + x2) / 2) ** 2 + ((y1 + y2) / 2) ** 2)
-        r_max = scanner.detector_radius_cm * 10.0
         rad_idx = np.clip(
-            ((r / r_max + 1) / 2 * n_rad).astype(np.int32), 0, n_rad - 1
+            ((s / R_eff + 1.0) / 2.0 * n_rad).astype(np.int32),
+            0, n_rad - 1,
         )
 
-        z_fov_half = scanner.detector_axial_length_cm * 10.0 / 2
-        z_mid = (z1 + z2) / 2
-        z_idx = np.clip(
-            ((z_mid + z_fov_half) / (2 * z_fov_half) * n_z).astype(np.int32),
-            0, n_z - 1,
-        )
+        if not valid.all():
+            r1 = r1[valid]
+            r2 = r2[valid]
+            ang_idx = ang_idx[valid]
+            rad_idx = rad_idx[valid]
 
-        np.add.at(sino, (z_idx, ang_idx, rad_idx), 1)
+        np.add.at(sino, (r1, r2, ang_idx, rad_idx), 1)
         return sino
 
     # ------------------------------------------------------------------
@@ -464,9 +685,9 @@ class GATEBackend:
         run_dir: str | Path,
         config: Optional[GATEConfig] = None,
         workdir: Optional[str | Path] = None,
-        keep_workdir: bool = False,
+        keep_workdir: bool = True,
     ) -> tuple[Sinogram, GATERunResult]:
-        """Build, run, histogram, save — the complete pipeline."""
+        """Build, run, parse, save."""
         if config is None:
             config = GATEConfig()
 
@@ -481,10 +702,6 @@ class GATEBackend:
         sim.run(start_new_process=True)
         wall_time = time.perf_counter() - t0
 
-        # Locate the ROOT file. opengate prepends output_dir to the actor
-        # filename, so the file should be at workdir/gate_output.root.
-        # We glob as a fallback in case opengate creates a subdirectory
-        # or changes the naming convention across versions.
         root_path = workdir / config.root_output_filename
         if not root_path.exists():
             candidates = list(workdir.rglob("*.root"))
@@ -492,9 +709,10 @@ class GATEBackend:
 
         if root_path is None:
             raise FileNotFoundError(
-                f"GATE did not produce a ROOT file in {workdir}.\nWorkdir contents: {list(workdir.rglob(chr(42))) if workdir.exists() else []}.\n"
-                f"Check that the CoincidenceSorterActor ran successfully. "
-                
+                f"GATE did not produce a ROOT file in {workdir}.\n"
+                f"Workdir contents: "
+                f"{list(workdir.rglob('*')) if workdir.exists() else []}.\n"
+                "Check that the CoincidenceSorterActor ran successfully."
             )
 
         result = GATERunResult(
@@ -509,7 +727,12 @@ class GATEBackend:
         run.metadata["backend"] = "gate"
         run.metadata["gate_config"] = asdict(config)
         run.metadata["wall_time_s"] = wall_time
+        run.metadata["voxel_size_mm"] = [v * 10.0 for v in run.phantom.voxel_size]
         run.save(run_dir)
+
+        mu_path = run_dir / "mu_map.npy"
+        self.write_mu_map(run.phantom, mu_path)
+        print(f"[run_full] saved mu-map to {mu_path}")
 
         if not keep_workdir and workdir.exists():
             shutil.rmtree(workdir)

@@ -1449,6 +1449,7 @@ dependencies = [
     { name = "numpy" },
     { name = "opengate" },
     { name = "pyyaml" },
+    { name = "uproot" },
 ]
 
 [package.metadata]
@@ -1458,6 +1459,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "opengate", specifier = ">=10.1.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
+    { name = "uproot", specifier = ">=5.7.3" },
 ]
 
 [package.metadata.requires-dev]

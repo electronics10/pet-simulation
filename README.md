@@ -80,7 +80,8 @@ pet-simulation/
 │       ├── source.npz             # Activity distribution
 │       ├── scanner.yaml           # Scanner hardware spec
 │       ├── binning.yaml           # Sinogram layout choice
-│       └── sinogram.npz           # Trues + scatter arrays
+│       ├── sinogram.npz           # Trues + scatter arrays
+│       └── mu_map.npy             # 511 keV linear attenuation map (GATE only)
 ├── main.py
 └── README.md
 ```
@@ -89,7 +90,7 @@ pet-simulation/
 
 ## Setup
 
-### 1. Prerequisite
+### 1. Prerequisites
 
 - Ubuntu (24.04)
 - git
@@ -101,13 +102,13 @@ cd pet-simulation
 uv sync
 ```
 
-### 2. MCGPU-PET binary check
+### 2. MCGPU-PET binary
 
-Acknowledgement
+Acknowledgement:
 
 > J.L. Herraiz, A. Lopez-Montes, and A. Badal, "MCGPU-PET: An Open-Source Real-Time Monte Carlo PET Simulator", Computer Physics Communications 296 (2024) 109008; https://doi.org/10.1016/j.cpc.2023.109008
 
-I use MCGPU-PET (https://github.com/DIDSR/MCGPU-PET) in this project. The binary `MCGPU-PET.x` file is used as the direct backend, and it is GPU/CUDA dependent. Therefore, one may need to setup its own `MCGPU-PET.x`.
+`MCGPU-PET.x` is a GPU/CUDA-dependent binary. Build it from source:
 
 ```bash
 git clone https://github.com/DIDSR/MCGPU-PET
@@ -116,6 +117,11 @@ make                    # requires CUDA toolkit (nvcc)
 cp MCGPU-PET.x /path/to/pet-simulation/bin/
 cp -r sample_simulation/materials/* /path/to/pet-simulation/materials/
 ```
+
+### 3. GATE (opengate)
+
+Installed via `uv sync`. opengate downloads the required Geant4 data
+files automatically on first run.
 
 ---
 
@@ -141,38 +147,37 @@ The same `Run` can be handed to `MCGPUBackend` or `GATEBackend`.
 Backend-specific knobs (GPU number, physics list, etc.) live in
 `MCGPUConfig` and `GATEConfig` respectively.
 
-### Sinogram layout: the Michelogram
+### Sinogram formats: backend-specific
 
-PET sinograms use a **Michelogram** compression scheme to reduce storage.
-Ring pairs are grouped into segments by their ring difference, and
-compressed axially using a span parameter.
+The two backends currently produce sinograms with **different shapes**:
 
-`SinogramBinning` captures the four parameters that define this layout:
+| Backend | Shape | Interpretation |
+|---|---|---|
+| MCGPU | `(n_z_planes, n_angular, n_radial)` | Native Michelogram (span-compressed ring pairs) |
+| GATE | `(n_rings, n_rings, n_angular, n_radial)` | 4D ring-pair, lossless |
 
-| Parameter | Meaning |
-|---|---|
-| `n_radial_bins` | Radial bins per plane (transverse resolution) |
-| `n_angular_bins` | Angular bins per plane (typically `n_crystals/2`) |
-| `span` | Axial compression factor (odd integer; larger = more compression) |
-| `max_ring_difference` (MRD) | Maximum ring pair distance included |
+`Sinogram` carries an `axes` field documenting what each axis means:
+GATE sinograms have `axes=("ring1", "ring2", "angular", "radial")`,
+MCGPU has empty `axes` (legacy 3D).
 
-For the `mcgpu_sample` preset: span=11, MRD=79 → output shape `(1293, 168, 147)`.
-For the `bruker_albira` default: span=3, MRD=23 → output shape `(47, 32, 32)`.
+For the Bruker preset, GATE produces shape `(24, 24, 32, 32)` ≈ 590k bins
+≈ 2.4 MB per sinogram — small enough that lossless storage is fine.
 
 ### What gets saved per run
 
-Each `run_dir/` contains exactly six files after a successful run:
+Each `run_dir/` contains the following files after a successful run:
 
-| File | Contents |
-|---|---|
-| `run.yaml` | Manifest with seed, backend name, full backend config, timestamps |
-| `phantom.npz` | Voxelized geometry (material IDs + densities) |
-| `source.npz` | Activity distribution (Bq per voxel) |
-| `scanner.yaml` | Hardware spec |
-| `binning.yaml` | Sinogram layout |
-| `sinogram.npz` | Trues + scatter float32 arrays |
+| File | Contents | Backend |
+|---|---|---|
+| `run.yaml` | Manifest with seed, backend name, full backend config, timestamps, voxel size | both |
+| `phantom.npz` | Voxelized geometry (material IDs + densities) | both |
+| `source.npz` | Activity distribution (Bq per voxel) | both |
+| `scanner.yaml` | Hardware spec | both |
+| `binning.yaml` | Sinogram layout | both |
+| `sinogram.npz` | Trues + scatter float32 arrays + axes labels | both |
+| `mu_map.npy` | 511 keV linear attenuation map (cm⁻¹) | GATE |
 
-These six files are sufficient to **exactly reproduce the simulation**
+These files are sufficient to **exactly reproduce the simulation**
 years later, because `run.yaml` stores the complete `MCGPUConfig` or
 `GATEConfig` used.
 
@@ -180,7 +185,7 @@ years later, because `run.yaml` stores the complete `MCGPUConfig` or
 
 `run_full()` separates temporary scratch files from permanent output:
 
-- `run_dir` — permanent: gets the 6 essential files
+- `run_dir` — permanent: gets the essential output files
 - `workdir` — temporary: all simulator scratch files, **auto-deleted on success**,
   **preserved on crash** so you can inspect input files and logs
 
@@ -211,7 +216,6 @@ run = Run(phantom, source, scanner, binning, seed=42)
 backend = MCGPUBackend(executable="./bin/MCGPU-PET.x",
                        materials_dir="./materials")
 sinogram, result = backend.run_full(run, run_dir="./runs/mcgpu_0001")
-# → ./runs/mcgpu_0001/ now has 6 essential files
 ```
 
 ### Run GATE (Bruker scanner)
@@ -229,60 +233,38 @@ sinogram, result = backend.run_full(run, run_dir="./runs/gate_0001")
 
 ### Share a MaterialRegistry across both backends
 
-Both backends use `MaterialRegistry` for material name resolution.
-By default each backend builds its own, but you can share one instance —
-useful if you've added custom materials or want a single place to manage them.
-
 ```python
 from petsim.materials import MaterialRegistry, Material
 from petsim.backends import MCGPUBackend
 from petsim.backends.gate import GATEBackend
 
 registry = MaterialRegistry(mcgpu_materials_dir="./materials")
-
-# Register a custom tissue not in the defaults
 registry.register(Material(
     name="tumor",
     nominal_density=1.04,
-    mcgpu_file="soft_tissue_ICRP110_5-515keV.mcgpu.gz",  # reuse closest file
+    mcgpu_file="soft_tissue_ICRP110_5-515keV.mcgpu.gz",
     gate_name="G4_TISSUE_SOFT_ICRP",
 ))
 
 mcgpu_backend = MCGPUBackend(
     executable="./bin/MCGPU-PET.x",
-    materials_registry=registry,      # share the registry
+    materials_registry=registry,
 )
 gate_backend = GATEBackend(
     materials_db="./GateMaterials.db",
-    materials_registry=registry,      # same registry
+    materials_registry=registry,
 )
 ```
 
-### Load and reproduce an old run
+### Load an old run
 
 ```python
-from petsim import Run
-from petsim.backends import MCGPUBackend, MCGPUConfig
+from petsim import Run, Sinogram
 
 old_run = Run.load("./runs/mcgpu_0001")
-
-# Exact config is recorded in run.yaml
-config = MCGPUConfig(**old_run.metadata["mcgpu_config"])
-
-backend = MCGPUBackend(executable="./bin/MCGPU-PET.x",
-                       materials_dir="./materials")
-sinogram, _ = backend.run_full(old_run, run_dir="./runs/mcgpu_0001_repro",
-                                config=config)
-```
-
-### Access training arrays
-
-```python
-from petsim import Sinogram
-
-sinogram = Sinogram.load("./runs/mcgpu_0001/sinogram.npz")
-x = sinogram.trues    # (1293, 168, 147) float32 — model input
-y = sinogram.scatter  # (1293, 168, 147) float32 — model target
+sino = Sinogram.load("./runs/mcgpu_0001/sinogram.npz")
+x = sino.trues
+y = sino.scatter
 ```
 
 ---
@@ -298,13 +280,13 @@ y = sinogram.scatter  # (1293, 168, 147) float32 — model target
 
 ### Binning presets (`petsim/sinogram_binning.py`)
 
-| Preset | span | MRD | n_radial | n_angular | Output shape (n_z, ang, rad) |
-|---|---|---|---|---|---|
-| `mcgpu_sample` | 11 | 79 | 147 | 168 | (1293, 168, 147) |
-| `bruker_albira` | 3 | 23 | 32 | 32 | (47, 32, 32) |
+| Preset | span | MRD | n_radial | n_angular |
+|---|---|---|---|---|
+| `mcgpu_sample` | 11 | 79 | 147 | 168 |
+| `bruker_albira` | 3 | 23 | 32 | 32 |
 
-`SinogramBinning.default_for(scanner)` computes sensible defaults
-(span=3, MRD=n_rings-1, n_radial=n_angular=n_crystals/2) for any scanner.
+`SinogramBinning.default_for(scanner)` computes sensible defaults for
+any scanner.
 
 ---
 
@@ -313,144 +295,135 @@ y = sinogram.scatter  # (1293, 168, 147) float32 — model target
 Material name resolution is centralised in `petsim/materials.py`.
 The `MaterialRegistry` is the single source of truth, used by both backends.
 
-### MaterialRegistry
-
 Each `Material` entry carries:
 - `name` — the petsim name you use in Python (`"water"`, `"lyso"`, ...)
 - `nominal_density` — default density in g/cm³
 - `mcgpu_file` — filename of the `.mcgpu.gz` cross-section table (MCGPU)
 - `gate_name` — Geant4 material name string (GATE)
 
-When you write `Phantom.cube(inner_material="water")`, both backends
-resolve `"water"` through the registry — MCGPU gets
-`water_5-515keV.mcgpu.gz`, GATE gets `G4_WATER`.
-
-Default materials cover air, water, and 14 ICRP 110 biological tissues
-(brain, lung, liver, muscle, etc.). See `_DEFAULT_MATERIALS` in
-`materials.py` for the full list.
+Default materials cover air, water, and 14 ICRP 110 biological tissues.
 
 ### MCGPU: `.mcgpu.gz` files
 
-MCGPU-PET cannot compute cross-sections at runtime. It reads
-**pre-tabulated cross-section tables** compressed as `.mcgpu.gz` files,
-one per material, from the `materials/` directory.
+MCGPU pre-tabulates cross-sections; one `.gz` file per material.
 
 ### GATE: `GateMaterials.db`
 
-GATE uses Geant4, which **computes cross-sections at runtime** from
-atomic composition. Standard materials (`G4_WATER`, `G4_AIR`, etc.)
-are built into Geant4's NIST database — no file needed. Custom
-materials like LYSO (the Bruker's crystal scintillator) must be defined
-in `GateMaterials.db` — a plain-text composition + density file.
+GATE uses Geant4, which computes cross-sections at runtime from atomic
+composition. Standard materials (`G4_WATER`, `G4_AIR`, etc.) are built
+into Geant4. Custom materials like LYSO must be defined in
+`GateMaterials.db`.
 
-`GATEBackend` copies the `.db` file into its workdir automatically.
-The crystal material name (e.g. `"lyso"` in `scanner.crystal_material`)
-is resolved via `registry.gate_name("lyso")` → `"LYSO"`.
+The two formats deliver the same physics; just differently.
 
-The two formats are physically the same thing — cross-section data —
-just delivered differently: MCGPU pre-tabulates, Geant4 computes at runtime.
+---
+
+## Status
+
+### Working
+
+- **MCGPU backend**: full pipeline (voxelized phantom + voxelized source + native
+  Michelogram output with trues/scatter split). Produced sinograms correctly
+  for the standard sample simulation.
+- **GATE backend Pass 1 (physics)**: voxelized phantom (ImageVolume) + voxelized
+  source (VoxelSource). Without the phantom volume, photons fly through
+  G4_AIR and never scatter — this was the root cause of zero-scatter
+  output in earlier iterations.
+- **GATE backend scatter labelling**: a separate `HitsCollectionActor` on
+  the phantom volume records every interaction. Coincidences classified as
+  trues / scatter / random by EventID match × phantom-scatter flag.
+  Validated: water cube in air gives ~20% scatter fraction, consistent
+  with NEMA NU4 published values for similar small-animal phantoms.
+- **GATE backend Pass 3 (auxiliary outputs)**: `mu_map.npy` and
+  `voxel_size_mm` in the run manifest.
+
+### Known issue: GATE histogrammer (Pass 2 in progress)
+
+The 4D ring-pair histogrammer produces correct **count totals** and
+correct **ring-pair occupancy** (anti-diagonal pattern for centered
+sources) but the **radial offset signal does not vary with view angle
+as expected**. A point-source displacement test shows ~88% of
+coincidences land on diametrically opposite crystals (`c2 = c1 + 32`)
+regardless of source position — suggesting the source displacement is
+not propagating through `VoxelSource` to the simulation.
+
+Possible causes (not yet verified):
+- `VoxelSource` may interpret MHD `Offset` differently than the MetaImage
+  spec dictates.
+- `VoxelSource` may centre the source on its `position.translation`
+  field instead of using the MHD offset.
+- The `_write_mhd_activity_image` coordinate convention may need
+  rechecking (corner-of-voxel vs center-of-voxel).
+
+The histogrammer logic itself (LOR midpoint, perpendicular angle, signed
+radial distance) is sound — this has been verified on synthetic LOR data.
+The issue is upstream in the source positioning.
+
+**To resume debugging:** see `test_point_source.py`. The next step is
+to test a large source displacement (e.g. +30 mm) and watch whether the
+`c2 - c1` distribution shifts. If it doesn't, switch to
+`pet_source.position.translation` as the source-positioning mechanism
+instead of relying on the MHD offset.
+
+### Recommendation while debugging is paused
+
+For ML pipeline development, **use MCGPU output**. The MCGPU sinogram
+format is correct (its native Michelogram), trues/scatter labelling
+works, and 1000× faster simulation makes batch generation tractable.
+GATE will become the cross-validation simulator and lab-shared
+infrastructure for sister tasks (denoising, motion correction, PVC)
+once the point-source issue is resolved.
 
 ---
 
 ## TODO
 
-### Sinogram format: MCGPU's Michelogram vs simulator-agnostic list-mode (critical decision)
+### GATE histogrammer (paused, see Status)
 
-`_histogram_coincidences` in `gate.py` is a **placeholder** producing direct-segment only.
-GATE and MCGPU sinograms currently have **different shapes and bin conventions**.
+Resume with point-source displacement diagnostic. Likely fix is
+switching from MHD-offset positioning to explicit
+`pet_source.position.translation`.
 
-**The core issue:** MCGPU uses a nonstandard Michelogram compression (1293 z-planes for
-mcgpu_sample, not the textbook 1153). Matching MCGPU's exact format means locking the
-entire pipeline to one tool's idiosyncratic conventions.
+### Cross-backend sinogram format reconciliation (deferred)
 
-**Three architectural options exist. Choose one before implementing the histogrammer:**
+GATE produces 4D `(ring1, ring2, angular, radial)`; MCGPU produces 3D
+Michelogram `(n_z, angular, radial)`. The two are not bin-comparable.
+Three options exist (see git history for the full discussion):
 
-#### Option A: Match MCGPU's native Michelogram exactly
+- **Option A:** Re-bin GATE to MCGPU's Michelogram. Locks pipeline to
+  MCGPU's idiosyncratic conventions.
+- **Option B:** Force MCGPU to span=1, then re-bin its output to 4D.
+  Standard, publishable, larger files.
+- **Option C:** Keep both formats, treat GATE as physics-validation
+  reference only. Train ML model on MCGPU exclusively.
 
-**Pros:**
-- MCGPU data is in its native format (no re-binning needed)
-- Direct comparison of bin-by-bin sinograms
-
-**Cons:**
-- MCGPU's convention is nonstandard and undocumented (reverse-engineering required)
-- Locks the pipeline to MCGPU's quirks for all future work
-- GATE output must be re-binned to match MCGPU's scheme
-- Hard to publish: reviewers may question MCGPU's format
-
-**Implementation:** Empirically reverse-engineer MCGPU's ring-pair → z-plane mapping by
-running single-z-slice phantoms through MCGPU and observing where counts land. Then
-implement ring-pair → z-plane + angular/radial binning in `_histogram_coincidences`.
-
-#### Option B: Use simulator-agnostic 4D format `(ring1, ring2, angular, radial)`
-
-**Pros:**
-- Standard, reproducible, defensible for publication (no simulator lock-in)
-- GATE histogrammer is ~30 lines (trivial)
-- Easy to add new simulators later
-- Clear, well-defined coordinates
-
-**Cons:**
-- MCGPU output must be post-processed (span=1 only, or re-binning from span>1)
-- Larger output shape: `(24, 24, 32, 32) = 589KB` per sinogram for Bruker (still fine)
-- Can't use MCGPU's span>1 compression during simulation (only span=1)
-
-**Implementation:** Keep `SinogramBinning` but deprecate `span` and `max_ring_difference`.
-Force `span=1` in MCGPUConfig. GATE produces 4D directly. Both backends output the same
-shape and semantics.
-
-#### Option C: Keep separate formats; use GATE as validation only
-
-**Pros:**
-- No architectural changes needed
-- MCGPU runs in native span>1 (if that matters for speed)
-- GATE is a "reference physics check" not an interchangeable source
-
-**Cons:**
-- GATE and MCGPU sinograms are not comparable bin-by-bin
-- Can only train on MCGPU data
-- Requires two separate models if you want GATE results
-
-**Implementation:** Leave the placeholder as-is. Run GATE + MCGPU on same phantoms,
-verify total counts and scatter fractions are similar (physics validation), move on.
-
-#### Recommendation
-
-**Option B** is most robust for a research pipeline. It decouples you from MCGPU's
-idiosyncrasies and makes the work more publishable. The 589KB per sinogram is negligible.
-If span compression matters for speed later, you can add it as a post-processing step
-after training.
-
-**To implement Option B:**
-
-1. Modify `SinogramBinning` to remove/deprecate `span` and `MRD` fields
-2. Ensure MCGPU always uses `span=1` (update MCGPUConfig defaults)
-3. Write `_histogram_coincidences` to bin GATE list-mode into `(ring1, ring2, ang, rad)`
-   - For each coincidence pair: extract ring indices from (x,y,z) positions
-   - Compute angular bin from LOR azimuth: `atan2(y2-y1, x2-x1) % pi`
-   - Compute radial bin from perpendicular distance to FOV axis
-4. Validate: run same water cube through both, verify shapes match and counts are comparable
-
-**Choose before next session.** The decision affects the entire histogrammer design.
-
-### Voxelized source for GATE
-
-Currently uses a point source at the FOV center. The ITK export
-(`_write_mhd_activity_image`) is already implemented but not
-yet wired up. Replace the `GenericSource` point source in
-`GATEBackend.build()` with a `VoxelizedSource` reading from
-`source_activity.mhd`.
-
-### Scatter labelling for GATE
-
-GATE can label scattered coincidences via `EventID` matching — compare
-the EventID of both detected photons; if they differ, it's a scatter.
-Currently `sinogram.scatter` is `None` for GATE runs. This needs to
-be implemented in `parse_sinogram()`.
+Option C is the current de-facto state. Option B is the long-term
+target. Decide before scaling up data generation.
 
 ### Batch generation
 
 Write a script to generate N runs with randomized phantoms (varying
-shape, size, activity distribution) for ML training data.
+shape, size, activity distribution, materials) for ML training data.
+Latin hypercube sampling over the parameter space is a candidate.
+
+### Geometry convention reconciliation (minor)
+
+`detector_radius_cm` means slightly different things in the two
+backends:
+- MCGPU: cylindric detector radius
+- GATE: inner edge of crystal block (so crystal centers sit at
+  `radius + crystal_x/2`)
+
+For Bruker this is a ~5 mm offset. Affects scatter-fraction comparison
+between backends. Adopt "crystal-center radius" as canonical when
+reconciling.
+
+### LYSO density (minor)
+
+`GateMaterials.db` defines LYSO at 5.37 g/cm³, below real LYSO (~7.1).
+Composition is also off (real LYSO is Lu-dominated by mass).
+Affects detection efficiency in GATE. The Python `MaterialRegistry`
+records 7.10 g/cm³, but inside GATE the `.db` value wins — fix in `.db`.
 
 ---
 
@@ -469,12 +442,15 @@ scanner specs. GATE 10 (`opengate`) is the Python-native replacement.
 - **Scanner does not own binning.** Scanner is hardware; SinogramBinning
   is a choice. The same scanner can produce different sinogram layouts.
   Binning lives in `Run.binning` and is passed to both backends.
-- **MCGPUConfig owns only MCGPU-specific runtime knobs** (GPU number,
-  PSF size, image resolution). It no longer owns span/MRD/bin counts.
+- **Sinogram is rank-agnostic.** Stores arrays of arbitrary rank plus an
+  optional `axes` field. Backends choose what shape to produce.
 - **Auto-save on success, preserve on crash.** `run_full()` saves the
-  6 essential files to `run_dir` on success and deletes the temp workdir.
+  essential files to `run_dir` on success and deletes the temp workdir.
   On crash, the workdir is preserved for debugging.
 - **n_z_slices in MCGPU is an input parameter**, not the output shape.
   It is computed as `2*n_rings - 1` and written to the `.in` file.
-  The actual output z-planes (1293 for mcgpu_sample) are auto-detected
-  from file size at parse time.
+  The actual output z-planes are auto-detected from file size at parse time.
+- **GATE phantom must be a real volume.** A voxelized source alone is
+  not enough — without an `ImageVolume` made of real materials, photons
+  fly through G4_AIR with no scatter. This was the root cause of weeks
+  of debugging.
