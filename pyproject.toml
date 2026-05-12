@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.4",
     "opengate>=10.1.0",
+    "pyvista>=0.48.2",
     "pyyaml>=6.0.3",
     "uproot>=5.7.3",
 ]

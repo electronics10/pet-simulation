@@ -32,6 +32,50 @@ from typing import Any
 
 import yaml
 
+# =====================================================================
+# Scanner presets
+# =====================================================================
+
+SCANNER_PRESETS: dict[str, dict[str, Any]] = {
+    # Mirrors the MCGPU-PET sample_simulation/MCGPU-PET.in file.
+    # Toy geometry centered on a 9x9x9 cm phantom.
+    "mcgpu_sample": {
+        "name": "mcgpu_sample",
+        "detector_radius_cm": 9.05,
+        "detector_axial_length_cm": 12.656,
+        "n_rings": 80,
+        "n_crystals_per_ring": 336,
+        "energy_window_keV": (350.0, 600.0),
+        "energy_resolution": 0.12,
+        "acquisition_time_s": 1.0,
+    },
+
+    # Bruker small-animal PET scanner.
+    # Specs extracted from Bruker_PET1.mac (GATE 9.4.1):
+    #   - cylindricalPET: Rmax=82mm, Rmin=58mm, height=105mm
+    #   - rsector at x=67mm, crystal block 10x50x50 mm
+    #   - 8x8 crystals per module, 1x1x3 modules per rsector, 8 rsectors
+    #     → 24 rings axial, 64 crystals per ring
+    #   - LYSO crystals
+    #   - Energy window 350-650 keV, resolution 0.15 at 511 keV
+    #   - Coincidence window 10 ns
+    "bruker_albira": {
+        "name": "bruker_albira",
+        "detector_radius_cm": 6.2,         # crystal center at 67mm rsector + 10mm/2 - inner edge
+        "detector_axial_length_cm": 10.5,
+        "n_rings": 24,                     # 8 crystals * 3 modules
+        "n_crystals_per_ring": 64,         # 8 crystals * 8 rsectors
+        "energy_window_keV": (350.0, 650.0),
+        "energy_resolution": 0.15,
+        "acquisition_time_s": 1.0,
+        "coincidence_window_ns": 10.0,
+        "crystal_size_mm": (10.0, 6.25, 6.25),  # 50mm / 8 crystals
+        "crystal_material": "LYSO",
+        "crystals_per_module": (8, 8),
+        "modules_per_rsector": (1, 1, 3),
+        "n_rsectors": 8,
+    },
+}
 
 @dataclass
 class Scanner:
@@ -133,7 +177,7 @@ class Scanner:
     # ---- factories ----------------------------------------------------
 
     @classmethod
-    def from_preset(cls, preset: str, **overrides: Any) -> "Scanner":
+    def from_preset(cls, preset: str, **overrides: Any) -> Scanner:
         """Construct a Scanner from a named preset, optionally overriding
         individual fields.
 
@@ -193,55 +237,9 @@ class Scanner:
     def __repr__(self) -> str:
         return (
             f"Scanner({self.name!r}, "
-            f"R={self.detector_radius_cm}cm, "
-            f"L={self.detector_axial_length_cm}cm, "
+            f"radius={self.detector_radius_cm}cm, "
+            f"axial_length={self.detector_axial_length_cm}cm, "
             f"rings={self.n_rings}x{self.n_crystals_per_ring}, "
             f"E=({self.energy_window_keV[0]}, {self.energy_window_keV[1]}) keV, "
-            f"T={self.acquisition_time_s}s)"
+            f"acq_time={self.acquisition_time_s}s)"
         )
-
-
-# =====================================================================
-# Scanner presets
-# =====================================================================
-
-SCANNER_PRESETS: dict[str, dict[str, Any]] = {
-    # Mirrors the MCGPU-PET sample_simulation/MCGPU-PET.in file.
-    # Toy geometry centered on a 9x9x9 cm phantom.
-    "mcgpu_sample": {
-        "name": "mcgpu_sample",
-        "detector_radius_cm": 9.05,
-        "detector_axial_length_cm": 12.656,
-        "n_rings": 80,
-        "n_crystals_per_ring": 336,
-        "energy_window_keV": (350.0, 600.0),
-        "energy_resolution": 0.12,
-        "acquisition_time_s": 1.0,
-    },
-
-    # Bruker small-animal PET scanner.
-    # Specs extracted from Bruker_PET1.mac (GATE 9.4.1):
-    #   - cylindricalPET: Rmax=82mm, Rmin=58mm, height=105mm
-    #   - rsector at x=67mm, crystal block 10x50x50 mm
-    #   - 8x8 crystals per module, 1x1x3 modules per rsector, 8 rsectors
-    #     → 24 rings axial, 64 crystals per ring
-    #   - LYSO crystals
-    #   - Energy window 350-650 keV, resolution 0.15 at 511 keV
-    #   - Coincidence window 10 ns
-    "bruker_albira": {
-        "name": "bruker_albira",
-        "detector_radius_cm": 6.2,         # crystal center at 67mm rsector + 10mm/2 - inner edge
-        "detector_axial_length_cm": 10.5,
-        "n_rings": 24,                     # 8 crystals * 3 modules
-        "n_crystals_per_ring": 64,         # 8 crystals * 8 rsectors
-        "energy_window_keV": (350.0, 650.0),
-        "energy_resolution": 0.15,
-        "acquisition_time_s": 1.0,
-        "coincidence_window_ns": 10.0,
-        "crystal_size_mm": (10.0, 6.25, 6.25),  # 50mm / 8 crystals
-        "crystal_material": "LYSO",
-        "crystals_per_module": (8, 8),
-        "modules_per_rsector": (1, 1, 3),
-        "n_rsectors": 8,
-    },
-}

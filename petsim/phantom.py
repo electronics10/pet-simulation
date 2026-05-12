@@ -26,7 +26,7 @@ for translating to and from their native conventions at write time.
   - Origin: voxel (0, 0, 0) — the corner of the grid, NOT the center.
   - Axes: +x, +y, +z in array index order. For a numpy array `a`,
     `a[ix, iy, iz]` is the voxel at position (ix*dx, iy*dy, iz*dz).
-  - Units: millimeters everywhere in the public API. Backends convert
+  - Units: centimeters everywhere in the public API. Backends convert
     to their native units (MCGPU-PET uses cm natively; GATE uses mm).
   - Voxel position: a voxel's spatial center is at
     `((ix+0.5)*dx, (iy+0.5)*dy, (iz+0.5)*dz)`.
@@ -121,6 +121,70 @@ class Phantom:
             )
 
         self.material_names = tuple(self.material_names)
+
+    def show_slices(self, field: str = "material_ids", 
+                    slice_pos_ratio: Sequence[float] = (0.5,0.5,0.5),
+                    fig_name: str | None = None) -> None:
+        """
+        Three orthogonal slices through the phantom
+        --------
+        field: 'material_ids' or 'densities'
+        """
+        print(f"field = {field}")
+        arr = getattr(self, field)
+        nx, ny, nz = arr.shape
+        dx, dy, dz = self.voxel_size
+
+        # Slices
+        zz = int(nz*slice_pos_ratio[2])
+        yy = int(ny*slice_pos_ratio[1])
+        xx = int(nx*slice_pos_ratio[0])
+        axial = arr[:,:, zz]
+        coronal = arr[:, yy, :]
+        sagittal = arr[xx, :, :]
+        print(f"sliced at x={xx}, y={yy}, z={zz}")
+
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 3, figsize = (12, 4))
+
+        if field == "material_ids":
+            # Discrete colormap; one color per material
+            n_mats = len(self.material_names)
+            cmap = plt.get_cmap("tab10", n_mats)
+            kwargs = dict(cmap=cmap, vmin=0.5, vmax=n_mats + 0.5)
+        else:
+            kwargs = dict(cmap="viridis")
+
+        # .T because imshow expects (row, col) = (y, x) for natural display
+        axes[0].imshow(axial.T, origin="lower",
+                    extent=[0, nx * dx, 0, ny * dy], **kwargs)
+        axes[0].set_title(f"Axial  (z = {zz})")
+        axes[0].set_xlabel("x [cm]"); axes[0].set_ylabel("y [cm]")
+
+        axes[1].imshow(coronal.T, origin="lower",
+                    extent=[0, nx * dx, 0, nz * dz], **kwargs)
+        axes[1].set_title(f"Coronal  (y = {yy})")
+        axes[1].set_xlabel("x [cm]"); axes[1].set_ylabel("z [cm]")
+
+        im = axes[2].imshow(sagittal.T, origin="lower",
+                            extent=[0, ny * dy, 0, nz * dz], **kwargs)
+        axes[2].set_title(f"Sagittal  (x = {zz})")
+        axes[2].set_xlabel("y [cm]"); axes[2].set_ylabel("z [cm]")
+
+        if field == "material_ids":
+            cbar = fig.colorbar(im, ax=axes, ticks=range(1, n_mats + 1),
+                                fraction=0.025)
+            cbar.ax.set_yticklabels(self.material_names)
+        else:
+            fig.colorbar(im, ax=axes, label="density [g/cm³]", fraction=0.025)
+
+        fig.suptitle(f"{field}  —  shape {self.shape}, "
+                    f"voxel {self.voxel_size} cm")
+        plt.show()
+        if fig_name:
+            plt.savefig(f"{fig_name}")
+            print(f"figure saved as {fig_name}.png")
+
 
     # ---- convenience properties ------------------------------------------
 
