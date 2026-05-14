@@ -43,3 +43,5 @@ from petsim.backends import*
 
 phantom = Phantom.load("runs/mcgpu_0001/phantom.npz")
 print(phantom)
+
+#sdfs 
